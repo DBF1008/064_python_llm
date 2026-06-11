@@ -146,6 +146,14 @@ class Tool:
     input_schema: Dict = field(default_factory=dict)
     implementation: Optional[Callable] = None
     plugin: Optional[str] = None  # plugin tool came from, e.g. 'llm_tools_sqlite'
+    namespace: Optional[str] = None  # namespace for disambiguation, e.g. 'my_plugin'
+
+    @property
+    def qualified_name(self) -> str:
+        """Return namespace:name if namespace is set, otherwise just name."""
+        if self.namespace:
+            return f"{self.namespace}:{self.name}"
+        return self.name
 
     def __post_init__(self):
         # Convert Pydantic model to JSON schema if needed
@@ -160,6 +168,8 @@ class Tool:
         }
         if self.plugin:
             to_hash["plugin"] = self.plugin
+        if self.namespace:
+            to_hash["namespace"] = self.namespace
         return hashlib.sha256(json.dumps(to_hash).encode("utf-8")).hexdigest()
 
     @classmethod
@@ -227,6 +237,7 @@ def _implementation_arguments(tool: "Tool", tool_call: "ToolCall") -> dict:
 
 class Toolbox:
     name: Optional[str] = None
+    namespace: Optional[str] = None
     instance_id: Optional[int] = None
     _blocked = (
         "tools",
@@ -267,7 +278,7 @@ class Toolbox:
         cls.__init__ = wrapped_init
 
     @classmethod
-    def method_tools(cls) -> List[Tool]:
+    def method_tools(cls, namespace: Optional[str] = None) -> List[Tool]:
         tools = []
         for method_name in dir(cls):
             if method_name.startswith("_") or method_name in cls._blocked:
@@ -278,6 +289,8 @@ class Toolbox:
                     method,
                     name="{}_{}".format(cls.__name__, method_name),
                 )
+                if namespace:
+                    tool.namespace = namespace
                 tools.append(tool)
         return tools
 
@@ -291,6 +304,7 @@ class Toolbox:
             if callable(attr):
                 tool = Tool.function(attr, name=f"{self.__class__.__name__}_{name}")
                 tool.plugin = getattr(self, "plugin", None)
+                tool.namespace = getattr(self, "namespace", None)
                 yield tool
         yield from self._extra_tools
 
@@ -1844,7 +1858,11 @@ class Response(_BaseResponse):
         when resuming a chain whose history ends in unresolved calls).
         """
         tool_results = []
-        tools_by_name = {tool.name: tool for tool in self.prompt.tools}
+        tools_by_name = {}
+        for tool in self.prompt.tools:
+            tools_by_name[tool.name] = tool
+            if tool.namespace:
+                tools_by_name[tool.qualified_name] = tool
         if tool_calls_list is None:
             tool_calls_list = self.tool_calls()
 
@@ -2185,7 +2203,11 @@ class AsyncResponse(_BaseResponse):
         """
         if tool_calls_list is None:
             tool_calls_list = await self.tool_calls()
-        tools_by_name = {tool.name: tool for tool in self.prompt.tools}
+        tools_by_name = {}
+        for tool in self.prompt.tools:
+            tools_by_name[tool.name] = tool
+            if tool.namespace:
+                tools_by_name[tool.qualified_name] = tool
 
         # Run async prepare_async() on all Toolbox instances that need it
         instances_to_prepare: list[Toolbox] = []

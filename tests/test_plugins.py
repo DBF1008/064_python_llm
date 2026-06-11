@@ -234,6 +234,7 @@ def test_register_tools(tmpdir, logs_db):
                 },
                 implementation=upper,
                 plugin="ToolsPlugin",
+                namespace="ToolsPlugin",
             ),
             "count_chars": llm.Tool(
                 name="count_chars",
@@ -248,6 +249,7 @@ def test_register_tools(tmpdir, logs_db):
                 },
                 implementation=count_character_in_word,
                 plugin="ToolsPlugin",
+                namespace="ToolsPlugin",
             ),
             "llm_version": llm.Tool(
                 name="llm_version",
@@ -255,6 +257,7 @@ def test_register_tools(tmpdir, logs_db):
                 input_schema={"properties": {}, "type": "object"},
                 implementation=llm_version,
                 plugin="llm.default_plugins.default_tools",
+                namespace="llm.default_plugins.default_tools",
             ),
             "output_as_json": llm.Tool(
                 name="output_as_json",
@@ -266,6 +269,7 @@ def test_register_tools(tmpdir, logs_db):
                 },
                 implementation=output_as_json,
                 plugin="ToolsPlugin",
+                namespace="ToolsPlugin",
             ),
             "llm_time": llm.Tool(
                 name="llm_time",
@@ -273,6 +277,7 @@ def test_register_tools(tmpdir, logs_db):
                 input_schema={"properties": {}, "type": "object"},
                 implementation=llm_time,
                 plugin="llm.default_plugins.default_tools",
+                namespace="llm.default_plugins.default_tools",
             ),
         }
 
@@ -308,6 +313,7 @@ def test_register_tools(tmpdir, logs_db):
                         "type": "object",
                     },
                     "plugin": "ToolsPlugin",
+                    "namespace": "ToolsPlugin",
                 },
                 {
                     "arguments": {
@@ -317,12 +323,14 @@ def test_register_tools(tmpdir, logs_db):
                     "description": "Returns the current time, as local time and UTC",
                     "name": "llm_time",
                     "plugin": "llm.default_plugins.default_tools",
+                    "namespace": "llm.default_plugins.default_tools",
                 },
                 {
                     "name": "llm_version",
                     "description": "Return the installed version of llm",
                     "arguments": {"properties": {}, "type": "object"},
                     "plugin": "llm.default_plugins.default_tools",
+                    "namespace": "llm.default_plugins.default_tools",
                 },
                 {
                     "name": "output_as_json",
@@ -333,6 +341,7 @@ def test_register_tools(tmpdir, logs_db):
                         "type": "object",
                     },
                     "plugin": "ToolsPlugin",
+                    "namespace": "ToolsPlugin",
                 },
                 {
                     "name": "upper",
@@ -343,6 +352,7 @@ def test_register_tools(tmpdir, logs_db):
                         "type": "object",
                     },
                     "plugin": "ToolsPlugin",
+                    "namespace": "ToolsPlugin",
                 },
             ],
             "toolboxes": [],
@@ -629,6 +639,7 @@ def test_register_toolbox(tmpdir, logs_db):
                     "description": "Returns the current time, as local time and UTC",
                     "name": "llm_time",
                     "plugin": "llm.default_plugins.default_tools",
+                    "namespace": "llm.default_plugins.default_tools",
                     "arguments": {
                         "properties": {},
                         "type": "object",
@@ -639,11 +650,13 @@ def test_register_toolbox(tmpdir, logs_db):
                     "description": "Return the installed version of llm",
                     "arguments": {"properties": {}, "type": "object"},
                     "plugin": "llm.default_plugins.default_tools",
+                    "namespace": "llm.default_plugins.default_tools",
                 },
             ],
             "toolboxes": [
                 {
                     "name": "Filesystem",
+                    "namespace": "ToolboxPlugin",
                     "tools": [
                         {
                             "name": "Filesystem_list_files",
@@ -654,6 +667,7 @@ def test_register_toolbox(tmpdir, logs_db):
                 },
                 {
                     "name": "Memory",
+                    "namespace": "ToolboxPlugin",
                     "tools": [
                         {
                             "name": "Memory_append",

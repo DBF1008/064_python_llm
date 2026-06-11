@@ -641,7 +641,10 @@ def instantiate_from_spec(class_map: Dict[str, Type], spec: str):
         If the spec string format is invalid, if the class name is not found in
         class_map, if JSON parsing fails, or if argument parsing encounters errors.
     """
-    m = re.fullmatch(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:\((.*)\))?\s*$", spec)
+    m = re.fullmatch(
+        r"\s*([A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)?)\s*(?:\((.*)\))?\s*$",
+        spec,
+    )
     if not m:
         raise ValueError(f"Invalid spec string: '{spec}'")
     class_name, arg_body = m.group(1), (m.group(2) or "").strip()

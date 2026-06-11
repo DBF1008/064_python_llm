@@ -39,12 +39,14 @@ from .embeddings import Collection
 from .templates import Template
 from .plugins import pm, load_plugins
 import click
-from typing import Any, Dict, List, Optional, Callable, Type, Union
+from typing import Any, Dict, List, Optional, Callable, Tuple, Type, Union
+import collections
 import inspect
 import json
 import os
 import pathlib
 import struct
+import warnings
 
 __all__ = [
     "AsyncConversation",
@@ -60,6 +62,7 @@ __all__ = [
     "get_async_model",
     "get_key",
     "get_model",
+    "get_tool",
     "hookimpl",
     "KeyModel",
     "Message",
@@ -159,12 +162,19 @@ def get_fragment_loaders() -> Dict[
 
 
 def get_tools() -> Dict[str, Union[Tool, Type[Toolbox]]]:
-    """Return all tools (llm.Tool and llm.Toolbox) registered by plugins."""
-    load_plugins()
-    tools: Dict[str, Union[Tool, Type[Toolbox]]] = {}
+    """Return all tools (llm.Tool and llm.Toolbox) registered by plugins.
 
-    # Variable to track current plugin name
-    current_plugin_name = None
+    Each tool is keyed by its short name when there is no conflict. When
+    multiple plugins register a tool with the same short name, the
+    conflicting entries are keyed only by their qualified name
+    (``namespace:short_name``) and a warning is emitted.
+    """
+    load_plugins()
+
+    # Pass 1: Collect all tools with namespace info
+    all_tools: List[Tuple[str, Optional[str], Union[Tool, Type[Toolbox]]]] = []
+
+    current_plugin_name: Optional[str] = None
 
     def register(
         tool_or_function: Union[Tool, Type[Toolbox], Callable[..., Any]],
@@ -178,6 +188,7 @@ def get_tools() -> Dict[str, Union[Tool, Type[Toolbox]]]:
                 tool = tool_or_function
                 if current_plugin_name:
                     tool.plugin = current_plugin_name
+                    tool.namespace = current_plugin_name
                 tool.name = name or tool.__name__
             else:
                 raise TypeError(
@@ -193,30 +204,23 @@ def get_tools() -> Dict[str, Union[Tool, Type[Toolbox]]]:
                 tool.name = name
             if current_plugin_name:
                 tool.plugin = current_plugin_name
+                tool.namespace = current_plugin_name
 
         # If it's a bare function, wrap it in a Tool
         else:
             tool = Tool.function(tool_or_function, name=name)
             if current_plugin_name:
                 tool.plugin = current_plugin_name
+                tool.namespace = current_plugin_name
 
-        # Get the name for the tool/toolbox
         if tool:
-            # For Toolbox classes, use their name attribute or class name
+            # Determine the short name
             if inspect.isclass(tool) and issubclass(tool, Toolbox):
-                prefix = name or getattr(tool, "name", tool.__name__) or ""
+                short_name = name or getattr(tool, "name", tool.__name__) or ""
             else:
-                prefix = name or tool.name or ""
+                short_name = name or tool.name or ""
 
-            suffix = 0
-            candidate = prefix
-
-            # Avoid name collisions
-            while candidate in tools:
-                suffix += 1
-                candidate = f"{prefix}_{suffix}"
-
-            tools[candidate] = tool
+            all_tools.append((short_name, current_plugin_name, tool))
 
     # Call each plugin's register_tools hook individually to track current_plugin_name
     for plugin in pm.get_plugins():
@@ -228,7 +232,61 @@ def get_tools() -> Dict[str, Union[Tool, Type[Toolbox]]]:
         for impl in plugin_impls:
             impl.function(register=register)
 
+    # Pass 2: Detect conflicts and build result dict
+    name_groups: Dict[str, List[Tuple[Optional[str], Union[Tool, Type[Toolbox]]]]] = (
+        collections.defaultdict(list)
+    )
+    for short_name, namespace, tool in all_tools:
+        name_groups[short_name].append((namespace, tool))
+
+    tools: Dict[str, Union[Tool, Type[Toolbox]]] = {}
+    conflicts: Dict[str, List[str]] = {}
+
+    for short_name, entries in name_groups.items():
+        if len(entries) == 1:
+            # No conflict: register under short name only (backward compat)
+            namespace, tool = entries[0]
+            tools[short_name] = tool
+        else:
+            # Conflict: only register under qualified names
+            qualified_names = []
+            for namespace, tool in entries:
+                if namespace:
+                    qualified = f"{namespace}:{short_name}"
+                else:
+                    qualified = short_name
+                tools[qualified] = tool
+                qualified_names.append(qualified)
+            conflicts[short_name] = qualified_names
+
+    if conflicts:
+        for short_name, qualified_names in conflicts.items():
+            warnings.warn(
+                f"Tool name '{short_name}' is registered by multiple plugins: "
+                f"{', '.join(qualified_names)}. "
+                f"Use the fully qualified name to reference them.",
+                stacklevel=2,
+            )
+
     return tools
+
+
+def get_tool(name: str) -> Union[Tool, Type[Toolbox]]:
+    """Look up a single tool by short name or qualified name (namespace:name)."""
+    tools = get_tools()
+    if name in tools:
+        return tools[name]
+    # Try matching qualified name against non-conflicting tools
+    if ":" in name:
+        ns, short = name.split(":", 1)
+        for tool in tools.values():
+            tool_ns = getattr(tool, "namespace", None)
+            tool_name = getattr(tool, "name", None)
+            if tool_ns == ns and tool_name == short:
+                return tool
+    raise KeyError(
+        f"Tool '{name}' not found. Available: {', '.join(sorted(tools.keys()))}"
+    )
 
 
 def get_embedding_models_with_aliases() -> List["EmbeddingModelWithAliases"]:

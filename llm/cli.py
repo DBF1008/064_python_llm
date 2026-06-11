@@ -2727,28 +2727,30 @@ def tools_list(tool_defs, json_, python_tools):
     toolbox_objects = []
     for name, tool in sorted(tools.items()):
         if isinstance(tool, Tool):
-            tool_objects.append(tool)
-            output_tools.append(
-                {
-                    "name": name,
-                    "description": tool.description,
-                    "arguments": tool.input_schema,
-                    "plugin": tool.plugin,
-                }
-            )
+            tool_objects.append((name, tool))
+            entry = {
+                "name": name,
+                "description": tool.description,
+                "arguments": tool.input_schema,
+                "plugin": tool.plugin,
+            }
+            if tool.namespace:
+                entry["namespace"] = tool.namespace
+            output_tools.append(entry)
         else:
-            toolbox_objects.append(tool)
+            toolbox_objects.append((name, tool))
             output_toolboxes.append(
                 {
                     "name": name,
                     "tools": [
                         {
-                            "name": tool["name"],
-                            "description": tool["description"],
-                            "arguments": tool["arguments"],
+                            "name": t["name"],
+                            "description": t["description"],
+                            "arguments": t["arguments"],
                         }
-                        for tool in introspect_tools(tool)
+                        for t in introspect_tools(tool)
                     ],
+                    **({"namespace": tool.namespace} if getattr(tool, "namespace", None) else {}),
                 }
             )
     if json_:
@@ -2759,21 +2761,20 @@ def tools_list(tool_defs, json_, python_tools):
             )
         )
     else:
-        for tool in tool_objects:
+        for display_name, tool in tool_objects:
             sig = "()"
             if tool.implementation:
                 sig = str(inspect.signature(tool.implementation))
+            parts = [display_name, sig]
+            if tool.plugin:
+                parts.append(" (plugin: {})".format(tool.plugin))
             click.echo(
-                "{}{}{}\n".format(
-                    tool.name,
-                    sig,
-                    " (plugin: {})".format(tool.plugin) if tool.plugin else "",
-                )
+                "{}\n".format("".join(parts))
             )
             if tool.description:
                 click.echo(textwrap.indent(tool.description.strip(), "  ") + "\n")
-        for toolbox in toolbox_objects:
-            click.echo(toolbox.name + ":\n")
+        for display_name, toolbox in toolbox_objects:
+            click.echo(display_name + ":\n")
             for tool in toolbox.method_tools():
                 sig = (
                     str(inspect.signature(tool.implementation))
@@ -4124,6 +4125,21 @@ def _approve_tool_call(_, tool_call):
         raise CancelToolCall("User cancelled tool call")
 
 
+def _resolve_tool(name, registered_tools):
+    """Resolve a tool name (short or namespace:name) against registered tools."""
+    if name in registered_tools:
+        return registered_tools[name]
+    # Try matching qualified name against tools with namespace
+    if ":" in name:
+        ns, short = name.split(":", 1)
+        for tool in registered_tools.values():
+            tool_ns = getattr(tool, "namespace", None)
+            tool_name = getattr(tool, "name", None)
+            if tool_ns == ns and tool_name == short:
+                return tool
+    return None
+
+
 def _gather_tools(
     tool_specs: List[str], python_tools: List[str]
 ) -> List[Union[Tool, Type[Toolbox]]]:
@@ -4137,21 +4153,40 @@ def _gather_tools(
         for key, value in registered_tools.items()
         if inspect.isclass(value)
     )
-    bad_tools = [
-        tool for tool in tool_specs if tool.split("(")[0] not in registered_tools
-    ]
+    bad_tools = []
+    for tool in tool_specs:
+        base = tool.split("(")[0]
+        if _resolve_tool(base, registered_tools) is None:
+            # Check if this is a bare name that has namespace-qualified variants
+            qualified_matches = [
+                k for k in registered_tools if k.endswith(":" + base)
+            ]
+            if qualified_matches:
+                raise click.ClickException(
+                    "Tool '{}' is registered by multiple plugins. "
+                    "Use a qualified name: {}".format(
+                        base, ", ".join(sorted(qualified_matches))
+                    )
+                )
+            bad_tools.append(tool)
     if bad_tools:
         raise click.ClickException(
             "Tool(s) {} not found. Available tools: {}".format(
-                ", ".join(bad_tools), ", ".join(registered_tools.keys())
+                ", ".join(bad_tools), ", ".join(sorted(registered_tools.keys()))
             )
         )
     for tool_spec in tool_specs:
-        if not tool_spec[0].isupper():
+        base = tool_spec.split("(")[0]
+        # Strip namespace prefix to check if it's a Toolbox class
+        bare_name = base.split(":")[-1] if ":" in base else base
+        if not bare_name[0].isupper():
             # It's a function
-            tools.append(registered_tools[tool_spec])
+            tools.append(_resolve_tool(base, registered_tools))
         else:
-            # It's a class
+            # It's a class - build class map including namespace-resolved entries
+            resolved = _resolve_tool(base, registered_tools)
+            if resolved is not None and base not in registered_classes:
+                registered_classes[base] = resolved
             tools.append(instantiate_from_spec(registered_classes, tool_spec))
     return tools
 
