@@ -132,7 +132,8 @@ class Collection:
 
         content_hash = self.content_hash(value)
         if self.db["embeddings"].count_where(
-            "content_hash = ? and collection_id = ?", [content_hash, self.id]
+            "id = ? and content_hash = ? and collection_id = ?",
+            [id, content_hash, self.id],
         ):
             return
         embedding = self.model().embed(value)
@@ -195,19 +196,25 @@ class Collection:
                 break
             # Calculate hashes first
             items_and_hashes = [(item, self.content_hash(item[1])) for item in batch]
-            # Any of those hashes already exist?
-            existing_ids = [
-                row["id"]
+            # Check which (id, content_hash) pairs already exist - only skip
+            # entries whose ID already has the exact same content hash, so that
+            # changed content for an existing ID is always re-embedded.
+            batch_ids = [item[0] for item, _ in items_and_hashes]
+            existing_pairs = set()
+            if batch_ids:
                 for row in self.db.query(
                     """
-                    select id from embeddings
-                    where collection_id = ? and content_hash in ({})
-                    """.format(",".join("?" for _ in items_and_hashes)),
-                    [collection_id]
-                    + [item_and_hash[1] for item_and_hash in items_and_hashes],
-                )
+                    select id, content_hash from embeddings
+                    where collection_id = ? and id in ({})
+                    """.format(",".join("?" for _ in batch_ids)),
+                    [collection_id] + batch_ids,
+                ):
+                    existing_pairs.add((row["id"], row["content_hash"]))
+            filtered_batch = [
+                item
+                for item, h in items_and_hashes
+                if (item[0], h) not in existing_pairs
             ]
-            filtered_batch = [item for item in batch if item[0] not in existing_ids]
             embeddings = list(
                 self.model().embed_multi(item[1] for item in filtered_batch)
             )

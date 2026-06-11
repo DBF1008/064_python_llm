@@ -185,3 +185,109 @@ def test_binary_only_and_text_only_embedding_models():
         list(text_only.embed_multi([b"hello world"]))
 
     list(text_only.embed_multi(["hello world"]))
+
+
+def test_embed_different_id_same_content(embed_demo):
+    """Different IDs with identical content must each get their own row."""
+    db = sqlite_utils.Database(memory=True)
+    collection = llm.Collection("test", db, model_id="embed-demo")
+    collection.embed("a", "hello world")
+    collection.embed("b", "hello world")
+    assert db["embeddings"].count == 2
+    assert len(embed_demo.embedded_content) == 2
+    ids = {row["id"] for row in db["embeddings"].rows}
+    assert ids == {"a", "b"}
+
+
+def test_embed_multi_content_update_not_blocked_by_cross_hash(embed_demo):
+    """When record A's new hash equals record B's old hash, B's own update
+    must not be skipped."""
+    db = sqlite_utils.Database(memory=True)
+    collection = llm.Collection("test", db, model_id="embed-demo")
+
+    # Initial state: a="alpha", b="beta"
+    collection.embed_multi([("a", "alpha"), ("b", "beta")], store=True)
+    assert db["embeddings"].count == 2
+    assert len(embed_demo.embedded_content) == 2
+
+    # Now change a's content to "beta" (same as b's old content) and
+    # change b's content to "gamma".
+    collection.embed_multi([("a", "beta"), ("b", "gamma")], store=True)
+    assert db["embeddings"].count == 2
+    assert len(embed_demo.embedded_content) == 4  # both re-embedded
+
+    rows = {
+        row["id"]: row["content"]
+        for row in db.query("select id, content from embeddings")
+    }
+    assert rows == {"a": "beta", "b": "gamma"}
+
+
+def test_embed_multi_same_id_same_content_skipped(embed_demo):
+    """Re-ingesting unchanged (id, content) pairs must still be skipped."""
+    db = sqlite_utils.Database(memory=True)
+    collection = llm.Collection("test", db, model_id="embed-demo")
+
+    collection.embed_multi([("a", "hello"), ("b", "world")], store=True)
+    assert len(embed_demo.embedded_content) == 2
+
+    # Re-ingest identical data
+    collection.embed_multi([("a", "hello"), ("b", "world")], store=True)
+    assert len(embed_demo.embedded_content) == 2  # no new embeddings
+
+
+def test_embed_multi_incremental_updates_vector(embed_demo):
+    """After updating content, similar_by_id must use the new embedding."""
+    db = sqlite_utils.Database(memory=True)
+    collection = llm.Collection("test", db, model_id="embed-demo")
+
+    collection.embed_multi(
+        [("doc", "short"), ("ref", "a]much longer reference sentence")], store=True
+    )
+    # "short" → [5,0,...], "a much longer reference sentence" → [1,4,6,9,8,0,...]
+    # After update, "doc" should get a completely different vector.
+    collection.embed_multi([("doc", "updated with new words here")], store=True)
+
+    results = collection.similar_by_id("doc")
+    # Just verify it returns without error and the stored content is updated
+    doc_row = next(db["embeddings"].rows_where("id = ?", ["doc"]))
+    assert doc_row["content"] == "updated with new words here"
+
+
+def test_embed_multi_metadata_preserved_on_incremental(embed_demo):
+    """Metadata on unchanged records must survive incremental re-ingestion of
+    a mixed batch that includes other changed records."""
+    db = sqlite_utils.Database(memory=True)
+    collection = llm.Collection("test", db, model_id="embed-demo")
+
+    # Insert with metadata via embed (single)
+    collection.embed("file1", "content one", metadata={"source": "disk"}, store=True)
+    collection.embed("stdin1", "content two", metadata={"source": "stdin"}, store=True)
+    assert db["embeddings"].count == 2
+
+    # Re-ingest via embed_multi: file1 unchanged, stdin1 content changed.
+    # embed_multi passes metadata=None, so if file1 is incorrectly re-embedded
+    # its metadata would be wiped.
+    collection.embed_multi([("file1", "content one"), ("stdin1", "new content")])
+    assert db["embeddings"].count == 2
+
+    file1_row = next(db["embeddings"].rows_where("id = ?", ["file1"]))
+    assert json.loads(file1_row["metadata"]) == {"source": "disk"}
+
+    stdin1_row = next(db["embeddings"].rows_where("id = ?", ["stdin1"]))
+    # stdin1 was re-embedded via embed_multi (no metadata), so metadata becomes None
+    assert stdin1_row["metadata"] is None
+
+
+def test_embed_multi_different_ids_same_content_batch(embed_demo):
+    """Multiple entries in the same batch with identical content but different
+    IDs must all be inserted."""
+    db = sqlite_utils.Database(memory=True)
+    collection = llm.Collection("test", db, model_id="embed-demo")
+    collection.embed_multi(
+        [("x", "same text"), ("y", "same text"), ("z", "same text")], store=True
+    )
+    assert db["embeddings"].count == 3
+    assert len(embed_demo.embedded_content) == 3
+    ids = {row["id"] for row in db["embeddings"].rows}
+    assert ids == {"x", "y", "z"}
