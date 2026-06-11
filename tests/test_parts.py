@@ -1224,6 +1224,189 @@ class TestSqliteRehydrateMessages:
         assert isinstance(r3.prompt.messages[2].parts[0], llm.parts.ToolResultPart)
         assert r3.prompt.messages[2].parts[0].tool_call_id == "c1"
 
+    def test_three_response_chain_no_duplication(self, mock_model, tmp_path):
+        """A conversation with 3+ responses must not duplicate messages
+        when loaded via load_conversation. The chain reconstruction must
+        only append the current turn's new messages, not re-synthesize
+        the full history from legacy kwargs."""
+        import sqlite_utils
+        from llm.cli import load_conversation
+        from llm.migrations import migrate
+
+        class MultiTurnMock(type(mock_model)):
+            model_id = "multiturn_mock"
+
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            def execute(self, prompt, stream, response, conversation):
+                self.calls += 1
+                if self.calls == 1:
+                    response.add_tool_call(
+                        llm.ToolCall(name="tick", arguments={}, tool_call_id="c1")
+                    )
+                    if False:
+                        yield ""
+                else:
+                    yield f"answer{self.calls}"
+
+        def tick() -> str:
+            return "tock"
+
+        m = MultiTurnMock()
+        # Register the custom model so load_conversation finds it
+        from llm.plugins import pm
+
+        class MultiTurnPlugin:
+            __name__ = "MultiTurnPlugin"
+
+            @llm.hookimpl
+            def register_models(self, register):
+                register(m)
+
+        pm.register(MultiTurnPlugin(), name="test-multiturn-plugin")
+        try:
+            # First chain: q1 -> tool_call -> tool_result -> answer2
+            chain_response = m.chain("q1", tools=[tick])
+            chain_response.text()
+
+            db_path = tmp_path / "logs.db"
+            db = sqlite_utils.Database(str(db_path))
+            migrate(db)
+            chain_response.log_to_db(db)
+
+            # Load and continue: adds response #3 (answer3 to "q2")
+            conv = load_conversation(None, database=str(db_path))
+            r3 = conv.prompt("q2")
+            r3.text()
+            r3.log_to_db(db)
+
+            # Load again and continue: adds response #4 (answer4 to "q3")
+            conv2 = load_conversation(None, database=str(db_path))
+            r4 = conv2.prompt("q3")
+
+            # Expected chain:
+            # user(q1), assistant(tool_call), tool(result),
+            # assistant(answer2), user(q2), assistant(answer3), user(q3)
+            roles = [msg.role for msg in r4.prompt.messages]
+            assert roles == [
+                "user",
+                "assistant",
+                "tool",
+                "assistant",
+                "user",
+                "assistant",
+                "user",
+            ]
+            # Verify no duplicate tool messages (the bug would add extra
+            # tool/assistant pairs)
+            tool_count = sum(1 for r in roles if r == "tool")
+            assert tool_count == 1
+        finally:
+            pm.unregister(name="test-multiturn-plugin")
+
+    def test_tool_result_attachments_preserved_after_load(
+        self, mock_model, tmp_path
+    ):
+        """Tool result attachments must survive the SQLite round-trip
+        via load_conversation so the model can see them on follow-up
+        turns."""
+        import sqlite_utils
+        from llm.cli import load_conversation
+        from llm.migrations import migrate
+
+        class ToolWithAttachmentsMock(type(mock_model)):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            def execute(self, prompt, stream, response, conversation):
+                self.calls += 1
+                if self.calls == 1:
+                    response.add_tool_call(
+                        llm.ToolCall(
+                            name="get_image", arguments={}, tool_call_id="c1"
+                        )
+                    )
+                    if False:
+                        yield ""
+                else:
+                    yield "I see the image"
+
+        def get_image() -> llm.ToolOutput:
+            return llm.ToolOutput(
+                output="image loaded",
+                attachments=[
+                    llm.Attachment(
+                        type="image/png", content=b"\x89PNG\r\n\x1a\nfake"
+                    )
+                ],
+            )
+
+        m = ToolWithAttachmentsMock()
+        chain_response = m.chain("show me an image", tools=[get_image])
+        chain_response.text()
+
+        db_path = tmp_path / "logs.db"
+        db = sqlite_utils.Database(str(db_path))
+        migrate(db)
+        chain_response.log_to_db(db)
+
+        conv = load_conversation(None, database=str(db_path))
+        r3 = conv.prompt("describe it")
+
+        # Find the tool result message and check attachments
+        tool_msg = None
+        for msg in r3.prompt.messages:
+            if msg.role == "tool":
+                tool_msg = msg
+                break
+        assert tool_msg is not None
+        tool_result_part = tool_msg.parts[0]
+        assert isinstance(tool_result_part, llm.parts.ToolResultPart)
+        assert tool_result_part.tool_call_id == "c1"
+        assert len(tool_result_part.attachments) == 1
+        assert tool_result_part.attachments[0].type == "image/png"
+
+    def test_prompt_attachments_preserved_after_load(self, mock_model, tmp_path):
+        """Prompt attachments must survive load_conversation so the
+        model can see them on follow-up turns."""
+        import sqlite_utils
+        from llm.cli import load_conversation
+        from llm.migrations import migrate
+
+        mock_model.enqueue(["answer1"])
+        att = llm.Attachment(type="image/png", content=b"\x89PNG\r\n\x1a\nfake")
+        r1 = mock_model.prompt("q1", attachments=[att])
+        r1.text()
+
+        db_path = tmp_path / "logs.db"
+        db = sqlite_utils.Database(str(db_path))
+        migrate(db)
+        r1.log_to_db(db)
+
+        conv = load_conversation(None, database=str(db_path))
+        r2 = conv.prompt("q2")
+
+        # Find the user message with the attachment
+        user_msgs_with_attachments = [
+            m
+            for m in r2.prompt.messages
+            if m.role == "user"
+            and any(
+                isinstance(p, llm.parts.AttachmentPart) and p.attachment
+                for p in m.parts
+            )
+        ]
+        assert len(user_msgs_with_attachments) == 1
+        att_part = next(
+            p
+            for p in user_msgs_with_attachments[0].parts
+            if isinstance(p, llm.parts.AttachmentPart)
+        )
+        assert att_part.attachment.type == "image/png"
+
 
 class TestAddToolCallWithStreamEvents:
     """A plugin may yield StreamEvents *and* call response.add_tool_call().

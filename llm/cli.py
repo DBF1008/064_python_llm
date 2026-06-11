@@ -1338,17 +1338,97 @@ def load_conversation(
         "conversation_id = ?", [conversation_id], order_by="id"
     ):
         response_obj = response_class.from_row(db, response)
+        from llm.parts import (
+            AttachmentPart,
+            Message,
+            TextPart,
+            ToolResultPart,
+        )
+
         if conversation.responses:
             previous_response = conversation.responses[-1]
             # SQLite rows store each response's legacy current-turn inputs
             # (prompt text, attachments, tool_results), not the full
             # prompt.messages chain. Rebuild that chain here so follow-up
             # prompts via `llm -c` satisfy the Prompt.messages invariant.
-            response_obj.prompt._explicit_messages = (
+            #
+            # The previous response's prompt.messages already carries the
+            # full input chain, and _messages_now() gives its structured
+            # output. We only need to append the CURRENT turn's genuinely
+            # new messages (tool results and/or user message with
+            # attachments) — NOT response_obj.prompt.messages which would
+            # re-synthesize the full history from legacy kwargs and
+            # duplicate earlier turns for conversations with 3+ responses.
+            chain: list = (
                 list(previous_response.prompt.messages)
                 + list(previous_response._messages_now())
-                + list(response_obj.prompt.messages)
             )
+            # Tool result message (from this turn's input)
+            if response_obj.prompt.tool_results:
+                chain.append(
+                    Message(
+                        role="tool",
+                        parts=[
+                            ToolResultPart(
+                                name=tr.name,
+                                output=tr.output,
+                                tool_call_id=tr.tool_call_id,
+                                attachments=tr.attachments or [],
+                            )
+                            for tr in response_obj.prompt.tool_results
+                        ],
+                    )
+                )
+            # User message (prompt text + attachments)
+            user_parts: list = []
+            if response_obj.prompt._prompt:
+                user_parts.append(TextPart(text=response_obj.prompt._prompt))
+            for att in response_obj.attachments:
+                user_parts.append(AttachmentPart(attachment=att))
+            if user_parts:
+                chain.append(Message(role="user", parts=user_parts))
+            response_obj.prompt._explicit_messages = chain
+        else:
+            # First response: set _explicit_messages so prompt attachments
+            # and other legacy kwargs are captured for subsequent turns.
+            # Without this, response.prompt.messages would re-synthesize
+            # on each access, but the attachments stored on the response
+            # (not on the prompt) would be lost.
+            first_chain: list = []
+            if response_obj.prompt.system:
+                first_chain.append(
+                    Message(
+                        role="system",
+                        parts=[TextPart(text=response_obj.prompt.system)],
+                    )
+                )
+            if response_obj.prompt.tool_results:
+                first_chain.append(
+                    Message(
+                        role="tool",
+                        parts=[
+                            ToolResultPart(
+                                name=tr.name,
+                                output=tr.output,
+                                tool_call_id=tr.tool_call_id,
+                                attachments=tr.attachments or [],
+                            )
+                            for tr in response_obj.prompt.tool_results
+                        ],
+                    )
+                )
+            first_user_parts: list = []
+            if response_obj.prompt._prompt:
+                first_user_parts.append(
+                    TextPart(text=response_obj.prompt._prompt)
+                )
+            for att in response_obj.attachments:
+                first_user_parts.append(AttachmentPart(attachment=att))
+            if first_user_parts:
+                first_chain.append(
+                    Message(role="user", parts=first_user_parts)
+                )
+            response_obj.prompt._explicit_messages = first_chain
         conversation.responses.append(response_obj)
     return conversation
 

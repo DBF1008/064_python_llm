@@ -500,6 +500,7 @@ class Prompt:
                             name=tr.name,
                             output=tr.output,
                             tool_call_id=tr.tool_call_id,
+                            attachments=tr.attachments or [],
                         )
                         for tr in self.tool_results
                     ],
@@ -625,6 +626,7 @@ class _BaseConversation:
                             name=tr.name,
                             output=tr.output,
                             tool_call_id=tr.tool_call_id,
+                            attachments=tr.attachments or [],
                         )
                         for tr in tool_results
                     ],
@@ -1331,20 +1333,35 @@ class _BaseResponse:
                 [row["id"]],
             )
         ]
-        tool_results = [
-            ToolResult(
-                name=tool_results_row["name"],
-                output=tool_results_row["output"],
-                tool_call_id=tool_results_row["tool_call_id"],
+        tool_results = []
+        for tool_results_row in db.query(
+            """
+            select * from tool_results
+            where response_id = ?
+        """,
+            [row["id"]],
+        ):
+            # Load attachments for this tool result
+            tr_attachments = [
+                Attachment.from_row(att_row)
+                for att_row in db.query(
+                    """
+                    select attachments.* from attachments
+                    join tool_results_attachments on attachments.id = tool_results_attachments.attachment_id
+                    where tool_results_attachments.tool_result_id = ?
+                    order by tool_results_attachments."order"
+                """,
+                    [tool_results_row["id"]],
+                )
+            ]
+            tool_results.append(
+                ToolResult(
+                    name=tool_results_row["name"],
+                    output=tool_results_row["output"],
+                    tool_call_id=tool_results_row["tool_call_id"],
+                    attachments=tr_attachments,
+                )
             )
-            for tool_results_row in db.query(
-                """
-                select * from tool_results
-                where response_id = ?
-            """,
-                [row["id"]],
-            )
-        ]
 
         all_fragments = list(db.query(FRAGMENT_SQL, {"response_id": row["id"]}))
         fragments = [
@@ -1761,6 +1778,7 @@ class Response(_BaseResponse):
                             name=tr.name,
                             output=tr.output,
                             tool_call_id=tr.tool_call_id,
+                            attachments=tr.attachments or [],
                         )
                         for tr in tool_results
                     ],
@@ -2113,6 +2131,7 @@ class AsyncResponse(_BaseResponse):
                             name=tr.name,
                             output=tr.output,
                             tool_call_id=tr.tool_call_id,
+                            attachments=tr.attachments or [],
                         )
                         for tr in tool_results
                     ],
@@ -2648,6 +2667,7 @@ def _append_tool_results_to_chain(chain, tool_results, attachments) -> List[Any]
                         name=tr.name,
                         output=tr.output,
                         tool_call_id=tr.tool_call_id,
+                        attachments=tr.attachments or [],
                     )
                     for tr in tool_results
                 ],
