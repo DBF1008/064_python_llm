@@ -1130,6 +1130,7 @@ def chat(
         tools = conversation_tools
 
     template_obj = None
+    schema = None
     if template:
         params = dict(param)
         try:
@@ -1138,10 +1139,25 @@ def chat(
             raise click.ClickException(str(ex))
         if model_id is None and template_obj.model:
             model_id = template_obj.model
+        # Combine with template fragments/system_fragments
+        if template_obj.fragments:
+            fragments = [*template_obj.fragments, *fragments]
+        if template_obj.system_fragments:
+            system_fragments = [*template_obj.system_fragments, *system_fragments]
+        if template_obj.schema_object:
+            schema = template_obj.schema_object
         if template_obj.tools:
             tools = [*template_obj.tools, *tools]
         if template_obj.functions and template_obj._functions_is_trusted:
             python_tools = [template_obj.functions, *python_tools]
+        if template_obj.options:
+            # Make options mutable (they start as a tuple)
+            options = list(options)
+            # Load any options, provided they were not set using -o already
+            specified_options = dict(options)
+            for option_name, option_value in template_obj.options.items():
+                if option_name not in specified_options:
+                    options.append((option_name, option_value))
 
     # Figure out which model we are using
     if model_id is None:
@@ -1169,7 +1185,7 @@ def chat(
         conversation.before_call = _approve_tool_call
 
     # Validate options
-    validated_options = get_model_options(model.model_id)
+    validated_options = {}
     if options:
         try:
             validated_options = dict(
@@ -1179,6 +1195,11 @@ def chat(
             )
         except pydantic.ValidationError as ex:
             raise click.ClickException(render_errors(ex.errors()))
+    # Add on any default model options
+    default_options = get_model_options(model.model_id)
+    for key_, value in default_options.items():
+        if key_ not in validated_options:
+            validated_options[key_] = value
 
     kwargs = {}
     if validated_options:
@@ -1198,6 +1219,8 @@ def chat(
         kwargs["key"] = key
     if hide_reasoning:
         kwargs["hide_reasoning"] = True
+    if schema:
+        kwargs["schema"] = schema
 
     try:
         fragments_and_attachments = resolve_fragments(
@@ -1216,6 +1239,18 @@ def chat(
         argument_system_fragments = resolve_fragments(db, system_fragments)
     except FragmentNotFound as ex:
         raise click.ClickException(str(ex))
+
+    # Merge in any template attachments
+    if template_obj:
+        if template_obj.attachments:
+            argument_attachments = [
+                resolve_attachment(a) for a in template_obj.attachments
+            ] + argument_attachments
+        if template_obj.attachment_types:
+            argument_attachments = [
+                resolve_attachment_with_type(at.value, at.type)
+                for at in template_obj.attachment_types
+            ] + argument_attachments
 
     click.echo("Chatting with {}".format(model.model_id))
     click.echo("Type 'exit' or 'quit' to exit")
