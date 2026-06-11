@@ -1079,3 +1079,147 @@ def test_logs_markdown_omits_reasoning_heading_when_empty(log_path):
     result = runner.invoke(cli, ["logs", "-p", str(log_path)], catch_exceptions=False)
     assert result.exit_code == 0
     assert "## Reasoning" not in result.output
+
+
+def test_logs_filter_attachments(logs_db, mock_model):
+    """--attachments and --no-attachments filter by attachment presence."""
+    runner = CliRunner()
+    TINY_PNG = (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\xa6\x00\x00\x01\x1a"
+        b"\x02\x03\x00\x00\x00\xe6\x99\xc4^\x00\x00\x00\tPLTE\xff\xff\xff"
+        b"\x00\xff\x00\xfe\x01\x00\x12t\x01J\x00\x00\x00GIDATx\xda\xed\xd81\x11"
+        b"\x000\x08\xc0\xc0.]\xea\xaf&Q\x89\x04V\xe0>\xf3+\xc8\x91Z\xf4\xa2\x08EQ\x14E"
+        b"Q\x14EQ\x14EQ\xd4B\x91$I3\xbb\xbf\x08EQ\x14EQ\x14EQ\x14E\xd1\xa5"
+        b"\xd4\x17\x91\xc6\x95\x05\x15\x0f\x9f\xc5\t\x9f\xa4\x00\x00\x00\x00IEND\xaeB`"
+        b"\x82"
+    )
+
+    # Log a response WITH attachment
+    mock_model.enqueue(["with attachment"])
+    result = runner.invoke(
+        cli,
+        ["prompt", "-m", "mock", "describe this", "-a", "-"],
+        input=TINY_PNG,
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+
+    # Log a response WITHOUT attachment
+    mock_model.enqueue(["no attachment"])
+    result = runner.invoke(
+        cli,
+        ["prompt", "-m", "mock", "plain text"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+
+    # Verify both are in logs
+    all_logs = runner.invoke(cli, ["logs", "--json", "-n", "0"])
+    assert all_logs.exit_code == 0
+    records = json.loads(all_logs.output)
+    assert len(records) == 2
+
+    # --attachments should only show the one with attachment
+    with_attachments = runner.invoke(cli, ["logs", "--attachments", "--json", "-n", "0"])
+    assert with_attachments.exit_code == 0
+    records = json.loads(with_attachments.output)
+    assert len(records) == 1
+    assert records[0]["prompt"] == "describe this"
+    assert len(records[0]["attachments"]) > 0
+
+    # --no-attachments should only show the one without attachment
+    no_attachments = runner.invoke(
+        cli, ["logs", "--no-attachments", "--json", "-n", "0"]
+    )
+    assert no_attachments.exit_code == 0
+    records = json.loads(no_attachments.output)
+    assert len(records) == 1
+    assert records[0]["prompt"] == "plain text"
+    assert len(records[0]["attachments"]) == 0
+
+
+def test_logs_filter_no_tools(logs_db):
+    """--no-tools filter excludes responses with tool results."""
+    runner = CliRunner()
+    code = textwrap.dedent("""
+    def demo():
+        return "tool output"
+    """)
+
+    # Log a response WITH tool usage
+    result = runner.invoke(
+        cli,
+        [
+            "-m",
+            "echo",
+            "--functions",
+            code,
+            json.dumps({"tool_calls": [{"name": "demo"}]}),
+        ],
+    )
+    assert result.exit_code == 0
+
+    # Log a response WITHOUT tool usage
+    result = runner.invoke(cli, ["-m", "echo", "no tools here"])
+    assert result.exit_code == 0
+
+    # --no-tools should only show the one without tools
+    no_tools_result = runner.invoke(cli, ["logs", "--no-tools", "--json", "-n", "0"])
+    assert no_tools_result.exit_code == 0
+    records = json.loads(no_tools_result.output)
+    assert len(records) == 1
+    assert records[0]["prompt"] == "no tools here"
+    assert len(records[0]["tool_results"]) == 0
+
+
+def test_logs_filters_with_conversation(logs_db, mock_model):
+    """Filters work correctly with -c and --cid conversation modes."""
+    runner = CliRunner()
+    TINY_PNG = (
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\xa6\x00\x00\x01\x1a"
+        b"\x02\x03\x00\x00\x00\xe6\x99\xc4^\x00\x00\x00\tPLTE\xff\xff\xff"
+        b"\x00\xff\x00\xfe\x01\x00\x12t\x01J\x00\x00\x00GIDATx\xda\xed\xd81\x11"
+        b"\x000\x08\xc0\xc0.]\xea\xaf&Q\x89\x04V\xe0>\xf3+\xc8\x91Z\xf4\xa2\x08EQ\x14E"
+        b"Q\x14EQ\x14EQ\xd4B\x91$I3\xbb\xbf\x08EQ\x14EQ\x14EQ\x14E\xd1\xa5"
+        b"\xd4\x17\x91\xc6\x95\x05\x15\x0f\x9f\xc5\t\x9f\xa4\x00\x00\x00\x00IEND\xaeB`"
+        b"\x82"
+    )
+
+    # Create conversation 1: with attachment
+    mock_model.enqueue(["conv1 with attachment"])
+    result = runner.invoke(
+        cli,
+        ["prompt", "-m", "mock", "conv1 prompt", "-a", "-"],
+        input=TINY_PNG,
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+
+    # Get the conversation ID
+    conv1_id = list(logs_db["conversations"].rows)[0]["id"]
+
+    # Create conversation 2: without attachment
+    mock_model.enqueue(["conv2 no attachment"])
+    result = runner.invoke(
+        cli,
+        ["prompt", "-m", "mock", "conv2 prompt"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+
+    # -c (current conversation) with --attachments should show nothing
+    # (current conversation is conv2, which has no attachments)
+    result = runner.invoke(cli, ["logs", "-c", "--attachments", "--json"])
+    assert result.exit_code == 0
+    records = json.loads(result.output)
+    assert len(records) == 0
+
+    # --cid with --attachments should show conv1
+    result = runner.invoke(
+        cli, ["logs", "--cid", conv1_id, "--attachments", "--json"]
+    )
+    assert result.exit_code == 0
+    records = json.loads(result.output)
+    assert len(records) == 1
+    assert records[0]["prompt"] == "conv1 prompt"
+

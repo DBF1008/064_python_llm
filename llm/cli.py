@@ -1596,6 +1596,24 @@ order by prompt_attachments."order"
     is_flag=True,
     help="Filter for prompts with results from any tools",
 )
+@click.option(
+    "any_attachments",
+    "--attachments",
+    is_flag=True,
+    help="Filter for prompts with attachments",
+)
+@click.option(
+    "no_tools",
+    "--no-tools",
+    is_flag=True,
+    help="Filter for prompts without tool results",
+)
+@click.option(
+    "no_attachments",
+    "--no-attachments",
+    is_flag=True,
+    help="Filter for prompts without attachments",
+)
 @schema_option
 @click.option(
     "--schema-multi",
@@ -1663,6 +1681,9 @@ def logs_list(
     fragments,
     tools,
     any_tools,
+    any_attachments,
+    no_tools,
+    no_attachments,
     schema_input,
     schema_multi,
     latest,
@@ -1834,8 +1855,45 @@ def logs_list(
             sql_params[f"tool{i}"] = tool_name
             sql_params[f"plugin{i}"] = plugin_name
 
-        # AND means “must have all” — use OR instead if you want “any of”
+        # AND means "must have all" — use OR instead if you want "any of"
         where_bits.append(" and ".join(tool_clauses))
+
+    if no_tools:
+        # Filter for responses WITHOUT tool results or tool calls
+        where_bits.append("""
+            not exists (
+              select 1
+                from tool_results
+              where
+                tool_results.response_id = responses.id
+            )
+            and not exists (
+              select 1
+                from tool_calls
+              where
+                tool_calls.response_id = responses.id
+            )
+        """)
+    if any_attachments:
+        # Filter for responses with attachments
+        where_bits.append("""
+            exists (
+              select 1
+                from prompt_attachments
+              where
+                prompt_attachments.response_id = responses.id
+            )
+        """)
+    if no_attachments:
+        # Filter for responses WITHOUT attachments
+        where_bits.append("""
+            not exists (
+              select 1
+                from prompt_attachments
+              where
+                prompt_attachments.response_id = responses.id
+            )
+        """)
 
     schema_id = None
     if schema:
