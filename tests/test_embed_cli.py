@@ -713,3 +713,78 @@ def test_duplicate_content_embedded_only_once(embed_demo):
     # Should have only embedded one more thing
     assert db["embeddings"].count == 4
     assert len(embed_demo.embedded_content) == 4
+
+
+def test_similar_by_content_with_where(user_path):
+    path = str(user_path / "embeddings.db")
+    db = sqlite_utils.Database(path)
+    collection = Collection("demo", db, model_id="embed-demo")
+    collection.embed("1", "hello world", metadata={"source": "wiki"}, store=True)
+    collection.embed("2", "goodbye world", metadata={"source": "blog"}, store=True)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["similar", "demo", "-c", "hello world", "--where", "source wiki"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    lines = [l for l in result.output.splitlines() if l.strip()]
+    assert len(lines) == 1
+    parsed = json.loads(lines[0])
+    assert parsed["id"] == "1"
+    assert parsed["metadata"] == {"source": "wiki"}
+
+
+def test_similar_with_multiple_where(user_path):
+    path = str(user_path / "embeddings.db")
+    db = sqlite_utils.Database(path)
+    collection = Collection("demo", db, model_id="embed-demo")
+    collection.embed(
+        "1", "hello world", metadata={"source": "wiki", "lang": "en"}, store=True
+    )
+    collection.embed(
+        "2", "goodbye world", metadata={"source": "wiki", "lang": "fr"}, store=True
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "similar",
+            "demo",
+            "-c",
+            "hello world",
+            "--where",
+            "source wiki",
+            "--where",
+            "lang en",
+        ],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    lines = [l for l in result.output.splitlines() if l.strip()]
+    assert len(lines) == 1
+    assert json.loads(lines[0])["id"] == "1"
+
+
+def test_similar_with_summary(user_path_with_embeddings):
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["similar", "demo", "-c", "hello world", "--summary"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    assert "2 results" in result.output
+    assert "score range:" in result.output
+
+
+def test_similar_where_invalid_format(user_path_with_embeddings):
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["similar", "demo", "-c", "hello world", "--where", "novalue"],
+    )
+    assert result.exit_code != 0
+    assert "Invalid --where format" in result.output

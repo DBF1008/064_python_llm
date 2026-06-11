@@ -185,3 +185,64 @@ def test_binary_only_and_text_only_embedding_models():
         list(text_only.embed_multi([b"hello world"]))
 
     list(text_only.embed_multi(["hello world"]))
+
+
+def test_similar_with_where_filter():
+    db = sqlite_utils.Database(memory=True)
+    collection = llm.Collection("test", db, model_id="embed-demo")
+    collection.embed("1", "hello world", metadata={"source": "wiki"}, store=True)
+    collection.embed("2", "goodbye world", metadata={"source": "blog"}, store=True)
+    collection.embed("3", "hey there world", metadata={"source": "wiki"}, store=True)
+
+    results = collection.similar("hello world", where={"source": "wiki"})
+    ids = [r.id for r in results]
+    assert "1" in ids
+    assert "3" in ids
+    assert "2" not in ids
+
+
+def test_similar_by_id_with_where_filter():
+    db = sqlite_utils.Database(memory=True)
+    collection = llm.Collection("test", db, model_id="embed-demo")
+    collection.embed("1", "hello world", metadata={"source": "wiki"}, store=True)
+    collection.embed("2", "goodbye world", metadata={"source": "blog"}, store=True)
+    collection.embed("3", "hey there world", metadata={"source": "wiki"}, store=True)
+
+    results = collection.similar_by_id("1", where={"source": "wiki"})
+    ids = [r.id for r in results]
+    assert "3" in ids
+    assert "2" not in ids
+    assert "1" not in ids  # skip_id excludes source
+
+
+def test_similar_without_where_unchanged(collection):
+    results_no_where = collection.similar("hello world")
+    results_none_where = collection.similar("hello world", where=None)
+    results_empty_where = collection.similar("hello world", where={})
+    assert results_no_where == results_none_where == results_empty_where
+
+
+def test_similar_where_multiple_keys():
+    db = sqlite_utils.Database(memory=True)
+    collection = llm.Collection("test", db, model_id="embed-demo")
+    collection.embed(
+        "1", "hello world", metadata={"source": "wiki", "lang": "en"}, store=True
+    )
+    collection.embed(
+        "2", "goodbye world", metadata={"source": "wiki", "lang": "fr"}, store=True
+    )
+
+    results = collection.similar(
+        "hello world", where={"source": "wiki", "lang": "en"}
+    )
+    assert len(results) == 1
+    assert results[0].id == "1"
+
+
+def test_similar_where_invalid_key():
+    db = sqlite_utils.Database(memory=True)
+    collection = llm.Collection("test", db, model_id="embed-demo")
+    collection.embed("1", "hello world", metadata={"source": "wiki"}, store=True)
+
+    with pytest.raises(ValueError, match="Invalid metadata key"):
+        collection.similar("hello world", where={"bad key with spaces": "val"})

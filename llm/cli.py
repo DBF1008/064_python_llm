@@ -3502,7 +3502,16 @@ def embed_multi(
     envvar="LLM_EMBEDDINGS_DB",
 )
 @click.option("--prefix", help="Just IDs with this prefix", default="")
-def similar(collection, id, input, content, binary, number, plain, database, prefix):
+@click.option(
+    "-w",
+    "--where",
+    multiple=True,
+    help='Filter by metadata. Format: "key value". Repeatable.',
+)
+@click.option("--summary", is_flag=True, help="Show a summary of the results")
+def similar(
+    collection, id, input, content, binary, number, plain, database, prefix, where, summary
+):
     """
     Return top N similar IDs from a collection using cosine similarity.
 
@@ -3519,6 +3528,17 @@ def similar(collection, id, input, content, binary, number, plain, database, pre
     if not id and not content and not input:
         raise click.ClickException("Must provide content or an ID for the comparison")
 
+    where_dict = None
+    if where:
+        where_dict = {}
+        for w in where:
+            parts = w.split(None, 1)
+            if len(parts) != 2:
+                raise click.ClickException(
+                    "Invalid --where format. Expected 'key value', got: {}".format(w)
+                )
+            where_dict[parts[0]] = parts[1]
+
     if database:
         db = sqlite_utils.Database(database)
     else:
@@ -3534,7 +3554,9 @@ def similar(collection, id, input, content, binary, number, plain, database, pre
 
     if id:
         try:
-            results = collection_obj.similar_by_id(id, number, prefix=prefix)
+            results = collection_obj.similar_by_id(
+                id, number, prefix=prefix, where=where_dict
+            )
         except Collection.DoesNotExist:
             raise click.ClickException("ID not found in collection")
     else:
@@ -3550,7 +3572,9 @@ def similar(collection, id, input, content, binary, number, plain, database, pre
                     content = f.read()
         if not content:
             raise click.ClickException("No content provided")
-        results = collection_obj.similar(content, number, prefix=prefix)
+        results = collection_obj.similar(
+            content, number, prefix=prefix, where=where_dict
+        )
 
     for result in results:
         if plain:
@@ -3562,6 +3586,21 @@ def similar(collection, id, input, content, binary, number, plain, database, pre
             click.echo("")
         else:
             click.echo(json.dumps(asdict(result)))
+
+    if summary:
+        if not results:
+            click.echo("No results found.", err=True)
+        else:
+            scores = [r.score for r in results if r.score is not None]
+            click.echo(
+                "{} result{}, score range: {:.4f} - {:.4f}".format(
+                    len(results),
+                    "s" if len(results) != 1 else "",
+                    min(scores),
+                    max(scores),
+                ),
+                err=True,
+            )
 
 
 @cli.group(

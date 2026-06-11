@@ -4,10 +4,13 @@ from dataclasses import dataclass
 import hashlib
 from itertools import islice
 import json
+import re
 from sqlite_utils import Database
 from sqlite_utils.db import Table
 import time
 from typing import cast, Any, Dict, Iterable, List, Optional, Tuple, Union
+
+_SAFE_KEY = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_.]*$")
 
 
 @dataclass
@@ -241,6 +244,7 @@ class Collection:
         number: int = 10,
         skip_id: Optional[str] = None,
         prefix: Optional[str] = None,
+        where: Optional[Dict[str, Any]] = None,
     ) -> List[Entry]:
         """
         Find similar items in the collection by a given vector.
@@ -250,6 +254,7 @@ class Collection:
             number (int, optional): Number of similar items to return
             skip_id (str, optional): An ID to exclude from the results
             prefix: (str, optional): Filter results to IDs witih this prefix
+            where (dict, optional): Filter results by metadata key-value pairs (AND semantics)
 
         Returns:
             list: List of Entry objects
@@ -263,7 +268,7 @@ class Collection:
         self.db.register_function(distance_score, replace=True)
 
         where_bits = ["collection_id = ?"]
-        where_args = [str(self.id)]
+        where_args: list = [str(self.id)]
 
         if prefix:
             where_bits.append("id LIKE ? || '%'")
@@ -272,6 +277,13 @@ class Collection:
         if skip_id:
             where_bits.append("id != ?")
             where_args.append(skip_id)
+
+        if where:
+            for key, value in where.items():
+                if not _SAFE_KEY.match(key):
+                    raise ValueError(f"Invalid metadata key: {key!r}")
+                where_bits.append("json_extract(metadata, '$.{}') = ?".format(key))
+                where_args.append(value)
 
         return [
             Entry(
@@ -295,7 +307,11 @@ class Collection:
         ]
 
     def similar_by_id(
-        self, id: str, number: int = 10, prefix: Optional[str] = None
+        self,
+        id: str,
+        number: int = 10,
+        prefix: Optional[str] = None,
+        where: Optional[Dict[str, Any]] = None,
     ) -> List[Entry]:
         """
         Find similar items in the collection by a given ID.
@@ -304,6 +320,7 @@ class Collection:
             id (str): ID to search by
             number (int, optional): Number of similar items to return
             prefix: (str, optional): Filter results to IDs with this prefix
+            where (dict, optional): Filter results by metadata key-value pairs (AND semantics)
 
         Returns:
             list: List of Entry objects
@@ -320,11 +337,15 @@ class Collection:
         embedding = matches[0]["embedding"]
         comparison_vector = llm.decode(embedding)
         return self.similar_by_vector(
-            comparison_vector, number, skip_id=id, prefix=prefix
+            comparison_vector, number, skip_id=id, prefix=prefix, where=where
         )
 
     def similar(
-        self, value: Union[str, bytes], number: int = 10, prefix: Optional[str] = None
+        self,
+        value: Union[str, bytes],
+        number: int = 10,
+        prefix: Optional[str] = None,
+        where: Optional[Dict[str, Any]] = None,
     ) -> List[Entry]:
         """
         Find similar items in the collection by a given value.
@@ -333,12 +354,15 @@ class Collection:
             value (str or bytes): value to search by
             number (int, optional): Number of similar items to return
             prefix: (str, optional): Filter results to IDs with this prefix
+            where (dict, optional): Filter results by metadata key-value pairs (AND semantics)
 
         Returns:
             list: List of Entry objects
         """
         comparison_vector = self.model().embed(value)
-        return self.similar_by_vector(comparison_vector, number, prefix=prefix)
+        return self.similar_by_vector(
+            comparison_vector, number, prefix=prefix, where=where
+        )
 
     @classmethod
     def exists(cls, db: Database, name: str) -> bool:
