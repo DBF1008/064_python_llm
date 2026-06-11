@@ -1596,6 +1596,18 @@ order by prompt_attachments."order"
     is_flag=True,
     help="Filter for prompts with results from any tools",
 )
+@click.option(
+    "any_tool_calls",
+    "--tool-calls",
+    is_flag=True,
+    help="Filter for prompts where tools were called",
+)
+@click.option(
+    "any_attachments",
+    "--attachments",
+    is_flag=True,
+    help="Filter for prompts with attachments",
+)
 @schema_option
 @click.option(
     "--schema-multi",
@@ -1663,6 +1675,8 @@ def logs_list(
     fragments,
     tools,
     any_tools,
+    any_tool_calls,
+    any_attachments,
     schema_input,
     schema_multi,
     latest,
@@ -1809,6 +1823,26 @@ def logs_list(
                 from tool_results
               where
                 tool_results.response_id = responses.id
+            )
+        """)
+    if any_tool_calls:
+        # Any response where the model called at least one tool
+        where_bits.append("""
+            exists (
+              select 1
+                from tool_calls
+              where
+                tool_calls.response_id = responses.id
+            )
+        """)
+    if any_attachments:
+        # Any response that had at least one prompt attachment
+        where_bits.append("""
+            exists (
+              select 1
+                from prompt_attachments
+              where
+                prompt_attachments.response_id = responses.id
             )
         """)
     if tools:

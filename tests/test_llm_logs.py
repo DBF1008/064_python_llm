@@ -1079,3 +1079,164 @@ def test_logs_markdown_omits_reasoning_heading_when_empty(log_path):
     result = runner.invoke(cli, ["logs", "-p", str(log_path)], catch_exceptions=False)
     assert result.exit_code == 0
     assert "## Reasoning" not in result.output
+
+
+def test_logs_tool_calls_filter(user_path):
+    """--tool-calls filters to only responses that have tool_calls rows."""
+    log_path = str(user_path / "logs_tool_calls.db")
+    db = sqlite_utils.Database(log_path)
+    migrate(db)
+    start = datetime.datetime.now(datetime.timezone.utc)
+
+    # Response WITH tool calls
+    resp_with = str(monotonic_ulid()).lower()
+    db["responses"].insert(
+        {
+            "id": resp_with,
+            "prompt": "call a tool",
+            "response": "called tool",
+            "model": "test-model",
+            "datetime_utc": start.isoformat(),
+            "conversation_id": "c1",
+        }
+    )
+    db["tools"].insert({"id": 1, "hash": "h1", "name": "demo", "description": ""})
+    db["tool_calls"].insert(
+        {
+            "id": 1,
+            "response_id": resp_with,
+            "tool_id": 1,
+            "name": "demo",
+            "arguments": "{}",
+            "tool_call_id": "tc1",
+        }
+    )
+
+    # Response WITHOUT tool calls
+    time.sleep(0.01)
+    resp_without = str(monotonic_ulid()).lower()
+    db["responses"].insert(
+        {
+            "id": resp_without,
+            "prompt": "no tools",
+            "response": "plain response",
+            "model": "test-model",
+            "datetime_utc": (start + datetime.timedelta(seconds=1)).isoformat(),
+            "conversation_id": "c1",
+        }
+    )
+
+    runner = CliRunner()
+
+    # --tool-calls --json should return only the tool-calling response
+    result = runner.invoke(
+        cli,
+        ["logs", "-d", log_path, "--tool-calls", "-n", "0", "--json"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    logs = json.loads(result.output)
+    assert len(logs) == 1
+    assert logs[0]["prompt"] == "call a tool"
+
+    # Default text output should also work with --tool-calls
+    result_text = runner.invoke(
+        cli,
+        ["logs", "-d", log_path, "--tool-calls", "-n", "0"],
+        catch_exceptions=False,
+    )
+    assert result_text.exit_code == 0
+    assert "call a tool" in result_text.output
+    assert "no tools" not in result_text.output
+
+    # Without the filter both show up
+    result_all = runner.invoke(
+        cli,
+        ["logs", "-d", log_path, "-n", "0", "--json"],
+        catch_exceptions=False,
+    )
+    assert result_all.exit_code == 0
+    assert len(json.loads(result_all.output)) == 2
+
+
+def test_logs_attachments_filter(user_path):
+    """--attachments filters to only responses that have prompt_attachments."""
+    log_path = str(user_path / "logs_attachments.db")
+    db = sqlite_utils.Database(log_path)
+    migrate(db)
+    start = datetime.datetime.now(datetime.timezone.utc)
+
+    # Response WITH attachment
+    resp_with = str(monotonic_ulid()).lower()
+    db["responses"].insert(
+        {
+            "id": resp_with,
+            "prompt": "describe image",
+            "response": "it is a cat",
+            "model": "test-model",
+            "datetime_utc": start.isoformat(),
+            "conversation_id": "c1",
+        }
+    )
+    db["attachments"].insert(
+        {
+            "id": "att1",
+            "type": "image/png",
+            "path": None,
+            "url": None,
+            "content": b"\x89PNG",
+        }
+    )
+    db["prompt_attachments"].insert(
+        {
+            "response_id": resp_with,
+            "attachment_id": "att1",
+            "order": 0,
+        }
+    )
+
+    # Response WITHOUT attachment
+    time.sleep(0.01)
+    resp_without = str(monotonic_ulid()).lower()
+    db["responses"].insert(
+        {
+            "id": resp_without,
+            "prompt": "hello",
+            "response": "world",
+            "model": "test-model",
+            "datetime_utc": (start + datetime.timedelta(seconds=1)).isoformat(),
+            "conversation_id": "c1",
+        }
+    )
+
+    runner = CliRunner()
+
+    # --attachments --json should return only the attachment response
+    result = runner.invoke(
+        cli,
+        ["logs", "-d", log_path, "--attachments", "-n", "0", "--json"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    logs = json.loads(result.output)
+    assert len(logs) == 1
+    assert logs[0]["prompt"] == "describe image"
+
+    # Default text output should also work with --attachments
+    result_text = runner.invoke(
+        cli,
+        ["logs", "-d", log_path, "--attachments", "-n", "0"],
+        catch_exceptions=False,
+    )
+    assert result_text.exit_code == 0
+    assert "describe image" in result_text.output
+    assert "hello" not in result_text.output
+
+    # Without the filter both show up
+    result_all = runner.invoke(
+        cli,
+        ["logs", "-d", log_path, "-n", "0", "--json"],
+        catch_exceptions=False,
+    )
+    assert result_all.exit_code == 0
+    assert len(json.loads(result_all.output)) == 2
