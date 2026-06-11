@@ -185,3 +185,101 @@ def test_binary_only_and_text_only_embedding_models():
         list(text_only.embed_multi([b"hello world"]))
 
     list(text_only.embed_multi(["hello world"]))
+
+
+def test_embed_same_id_different_content_updates():
+    """Embedding same id with different content should update the row."""
+    db = sqlite_utils.Database(memory=True)
+    collection = llm.Collection("test", db, model_id="embed-demo")
+    collection.embed("1", "hello world", store=True)
+    assert db["embeddings"].count == 1
+    row = next(db["embeddings"].rows_where("id = ?", ["1"]))
+    assert row["content"] == "hello world"
+    old_hash = row["content_hash"]
+    # Now update id "1" with new content
+    collection.embed("1", "goodbye world", store=True)
+    assert db["embeddings"].count == 1
+    row = next(db["embeddings"].rows_where("id = ?", ["1"]))
+    assert row["content"] == "goodbye world"
+    assert row["content_hash"] != old_hash
+
+
+def test_embed_different_id_same_content_both_exist(embed_demo):
+    """Embedding different ids with same content should create separate rows."""
+    db = sqlite_utils.Database(memory=True)
+    collection = llm.Collection("test", db, model_id="embed-demo")
+    collection.embed("1", "hello world", store=True)
+    assert len(embed_demo.embedded_content) == 1
+    collection.embed("2", "hello world", store=True)
+    # Both should exist as separate records
+    assert db["embeddings"].count == 2
+    assert len(embed_demo.embedded_content) == 2
+    row1 = next(db["embeddings"].rows_where("id = ?", ["1"]))
+    row2 = next(db["embeddings"].rows_where("id = ?", ["2"]))
+    assert row1["content"] == "hello world"
+    assert row2["content"] == "hello world"
+    # similar_by_id should work for both
+    results1 = collection.similar_by_id("1")
+    assert any(r.id == "2" for r in results1)
+    results2 = collection.similar_by_id("2")
+    assert any(r.id == "1" for r in results2)
+
+
+def test_embed_same_id_same_content_skips(embed_demo):
+    """Re-embedding same id with same content should not call the model."""
+    db = sqlite_utils.Database(memory=True)
+    collection = llm.Collection("test", db, model_id="embed-demo")
+    collection.embed("1", "hello world")
+    assert len(embed_demo.embedded_content) == 1
+    # Embed again with same id and same content
+    collection.embed("1", "hello world")
+    assert db["embeddings"].count == 1
+    # Model should NOT have been called again
+    assert len(embed_demo.embedded_content) == 1
+
+
+def test_embed_multi_same_id_different_content_updates():
+    """Batch embedding existing id with new content should update the row."""
+    db = sqlite_utils.Database(memory=True)
+    collection = llm.Collection("test", db, model_id="embed-demo")
+    collection.embed("1", "hello world", store=True)
+    row = next(db["embeddings"].rows_where("id = ?", ["1"]))
+    old_hash = row["content_hash"]
+    # Now batch embed with same id but different content
+    collection.embed_multi([("1", "goodbye world")], store=True)
+    assert db["embeddings"].count == 1
+    row = next(db["embeddings"].rows_where("id = ?", ["1"]))
+    assert row["content"] == "goodbye world"
+    assert row["content_hash"] != old_hash
+
+
+def test_embed_multi_different_id_same_content_both_exist(embed_demo):
+    """Batch embedding new ids with existing content should create separate rows."""
+    db = sqlite_utils.Database(memory=True)
+    collection = llm.Collection("test", db, model_id="embed-demo")
+    collection.embed("1", "hello world", store=True)
+    assert len(embed_demo.embedded_content) == 1
+    # Batch embed same content under different ids
+    collection.embed_multi(
+        [("2", "hello world"), ("3", "hello world")], store=True
+    )
+    assert db["embeddings"].count == 3
+    assert len(embed_demo.embedded_content) == 3
+    for rid in ("1", "2", "3"):
+        row = next(db["embeddings"].rows_where("id = ?", [rid]))
+        assert row["content"] == "hello world"
+
+
+def test_embed_multi_re_run_idempotent(embed_demo):
+    """Running same batch twice should skip all on second run."""
+    db = sqlite_utils.Database(memory=True)
+    collection = llm.Collection("test", db, model_id="embed-demo")
+    batch = [("1", "hello world"), ("2", "goodbye world"), ("3", "foo bar")]
+    collection.embed_multi(batch, store=True)
+    assert db["embeddings"].count == 3
+    assert len(embed_demo.embedded_content) == 3
+    # Run same batch again
+    collection.embed_multi(batch, store=True)
+    assert db["embeddings"].count == 3
+    # Model should NOT have been called again
+    assert len(embed_demo.embedded_content) == 3
