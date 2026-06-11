@@ -34,17 +34,19 @@ from .parts import (
     tool_message,
     user,
 )
-from .utils import schema_dsl, Fragment
+from .utils import schema_dsl, Fragment, derive_namespace, split_tool_namespace
 from .embeddings import Collection
 from .templates import Template
 from .plugins import pm, load_plugins
 import click
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Callable, Type, Union
 import inspect
 import json
 import os
 import pathlib
 import struct
+import sys
 
 __all__ = [
     "AsyncConversation",
@@ -79,6 +81,9 @@ __all__ = [
     "tool_message",
     "ToolOutput",
     "ToolResult",
+    "ToolRegistry",
+    "ToolConflict",
+    "AmbiguousToolError",
     "Usage",
     "user",
     "user_dir",
@@ -229,6 +234,158 @@ def get_tools() -> Dict[str, Union[Tool, Type[Toolbox]]]:
             impl.function(register=register)
 
     return tools
+
+
+class AmbiguousToolError(Exception):
+    """Raised when a bare tool name is ambiguous due to multiple plugins registering it."""
+
+    pass
+
+
+@dataclass
+class ToolConflict:
+    """Records a naming conflict between tools from different plugins."""
+
+    name: str
+    plugins: List[str]
+
+
+class ToolRegistry:
+    """Holds both flat (backward-compat) and namespaced tool dictionaries.
+
+    Provides a unified get_tool() method that resolves tools by bare name
+    or 'namespace:name' syntax, raising AmbiguousToolError when a bare name
+    is registered by multiple plugins.
+    """
+
+    def __init__(self):
+        self.tools: Dict[str, Union[Tool, Type[Toolbox]]] = {}
+        self.namespaced: Dict[str, Union[Tool, Type[Toolbox]]] = {}
+        self.conflicts: List[ToolConflict] = []
+        self._ns_map: Dict[str, str] = {}
+
+    def get_tool(self, spec: str) -> Union[Tool, Type[Toolbox]]:
+        """Resolve a tool by bare name or 'namespace:name'.
+
+        - If spec has namespace prefix: look up in self.namespaced
+        - If bare name: look up in self.tools; raise AmbiguousToolError if ambiguous
+        """
+        ns, name = split_tool_namespace(spec)
+        if ns is not None:
+            key = "{}:{}".format(ns, name)
+            if key in self.namespaced:
+                return self.namespaced[key]
+            raise KeyError("Tool '{}' not found".format(key))
+        # Check for conflicts first (bare name may have been removed from self.tools)
+        for c in self.conflicts:
+            if c.name == name:
+                options = ", ".join(
+                    "{}:{}".format(derive_namespace(p), name) for p in c.plugins
+                )
+                raise AmbiguousToolError(
+                    "Tool '{}' is ambiguous, registered by multiple plugins. "
+                    "Use one of: {}".format(name, options)
+                )
+        # Bare name lookup
+        if name in self.tools:
+            return self.tools[name]
+        raise KeyError("Tool '{}' not found".format(name))
+
+
+def get_tools_with_namespaces() -> ToolRegistry:
+    """Like get_tools() but returns a ToolRegistry with namespace support.
+
+    - Flat dict preserves existing behavior (numeric suffix on collision)
+    - Namespaced dict keys every tool as "namespace:bare_name"
+    - Conflicts are detected and recorded (same bare name from different plugins)
+    - Warnings printed to stderr for conflicts
+    """
+    load_plugins()
+    registry = ToolRegistry()
+    bare_name_tracker: Dict[str, List] = {}
+    current_plugin_name = None
+
+    def register(
+        tool_or_function: Union[Tool, Type[Toolbox], Callable[..., Any]],
+        name: Optional[str] = None,
+    ) -> None:
+        tool: Union[Tool, Type[Toolbox], None] = None
+
+        if inspect.isclass(tool_or_function):
+            if issubclass(tool_or_function, Toolbox):
+                tool = tool_or_function
+                if current_plugin_name:
+                    tool.plugin = current_plugin_name
+                tool.name = name or tool.__name__
+            else:
+                raise TypeError(
+                    "Toolbox classes must inherit from llm.Toolbox, {} does not.".format(
+                        tool_or_function.__name__
+                    )
+                )
+        elif isinstance(tool_or_function, Tool):
+            tool = tool_or_function
+            if name:
+                tool.name = name
+            if current_plugin_name:
+                tool.plugin = current_plugin_name
+        else:
+            tool = Tool.function(tool_or_function, name=name)
+            if current_plugin_name:
+                tool.plugin = current_plugin_name
+
+        if tool:
+            if inspect.isclass(tool) and issubclass(tool, Toolbox):
+                bare_name = name or getattr(tool, "name", tool.__name__) or ""
+            else:
+                bare_name = name or tool.name or ""
+
+            plugin = current_plugin_name
+
+            # Track for conflict detection
+            bare_name_tracker.setdefault(bare_name, []).append((plugin, tool))
+
+            # Flat dict (same numeric suffix logic as get_tools)
+            suffix = 0
+            candidate = bare_name
+            while candidate in registry.tools:
+                suffix += 1
+                candidate = "{}_{}".format(bare_name, suffix)
+            registry.tools[candidate] = tool
+
+            # Namespaced dict
+            ns = derive_namespace(plugin) if plugin else ""
+            if plugin:
+                registry._ns_map[plugin] = ns
+            ns_key = "{}:{}".format(ns, bare_name) if ns else bare_name
+            registry.namespaced[ns_key] = tool
+
+    for plugin in pm.get_plugins():
+        current_plugin_name = pm.get_name(plugin)
+        hook_caller = pm.hook.register_tools
+        plugin_impls = [
+            impl for impl in hook_caller.get_hookimpls() if impl.plugin is plugin
+        ]
+        for impl in plugin_impls:
+            impl.function(register=register)
+
+    # Detect conflicts
+    for bare_name, entries in bare_name_tracker.items():
+        if len(entries) > 1:
+            plugins = [e[0] for e in entries]
+            conflict = ToolConflict(name=bare_name, plugins=plugins)
+            registry.conflicts.append(conflict)
+            # Remove bare name from flat dict so get_tool(bare_name) raises AmbiguousToolError
+            if bare_name in registry.tools:
+                del registry.tools[bare_name]
+            sys.stderr.write(
+                "Warning: tool '{}' registered by multiple plugins: {}. "
+                "Use namespace prefix to disambiguate.\n".format(
+                    bare_name, ", ".join(plugins)
+                )
+            )
+
+    return registry
 
 
 def get_embedding_models_with_aliases() -> List["EmbeddingModelWithAliases"]:

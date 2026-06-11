@@ -551,6 +551,27 @@ def has_plugin_prefix(value: str) -> bool:
     return bool(_plugin_prefix_re.match(value))
 
 
+def derive_namespace(plugin_name: str) -> str:
+    """Derive a short namespace from a plugin name.
+
+    Uses last dot-segment: 'a.b.c' -> 'c', 'no_dots' -> 'no_dots'.
+    """
+    parts = plugin_name.split(".")
+    return parts[-1] if parts else plugin_name
+
+
+def split_tool_namespace(spec: str) -> Tuple[Optional[str], str]:
+    """Split 'namespace:toolname' -> (namespace, toolname).
+
+    Returns (None, spec) if no namespace prefix found.
+    Uses existing has_plugin_prefix() for detection.
+    """
+    if has_plugin_prefix(spec):
+        ns, _, name = spec.partition(":")
+        return ns, name
+    return None, spec
+
+
 def _parse_kwargs(arg_str: str) -> Dict[str, Any]:
     """Parse key=value pairs where each value is valid JSON."""
     tokens = []

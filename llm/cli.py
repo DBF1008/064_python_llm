@@ -7,6 +7,7 @@ import io
 import json
 import os
 from llm import (
+    AmbiguousToolError,
     Attachment,
     AsyncConversation,
     AsyncKeyModel,
@@ -30,6 +31,7 @@ from llm import (
     get_embedding_model,
     get_plugins,
     get_tools,
+    get_tools_with_namespaces,
     get_fragment_loaders,
     get_template_loaders,
     get_model,
@@ -46,6 +48,7 @@ from llm.models import _BaseConversation, ChainResponse
 from .migrations import migrate
 from .plugins import pm, load_plugins
 from .utils import (
+    derive_namespace,
     ensure_fragment,
     extract_fenced_code_block,
     find_unused_key,
@@ -60,6 +63,7 @@ from .utils import (
     resolve_schema_input,
     schema_dsl,
     schema_summary,
+    split_tool_namespace,
     token_usage_string,
     truncate_string,
 )
@@ -2707,6 +2711,7 @@ def tools_list(tool_defs, json_, python_tools):
             )
         return methods
 
+    registry = None
     if tool_defs:
         tools = {}
         for tool in _gather_tools(tool_defs, python_tools):
@@ -2715,7 +2720,8 @@ def tools_list(tool_defs, json_, python_tools):
             else:
                 tools[tool.__class__.__name__] = tool
     else:
-        tools = get_tools()
+        registry = get_tools_with_namespaces()
+        tools = registry.tools
         if python_tools:
             for code_or_path in python_tools:
                 for tool in _tools_from_code(code_or_path):
@@ -2727,15 +2733,17 @@ def tools_list(tool_defs, json_, python_tools):
     toolbox_objects = []
     for name, tool in sorted(tools.items()):
         if isinstance(tool, Tool):
+            ns = derive_namespace(tool.plugin) if tool.plugin else None
             tool_objects.append(tool)
-            output_tools.append(
-                {
-                    "name": name,
-                    "description": tool.description,
-                    "arguments": tool.input_schema,
-                    "plugin": tool.plugin,
-                }
-            )
+            entry = {
+                "name": name,
+                "description": tool.description,
+                "arguments": tool.input_schema,
+                "plugin": tool.plugin,
+            }
+            if ns:
+                entry["namespace"] = ns
+            output_tools.append(entry)
         else:
             toolbox_objects.append(tool)
             output_toolboxes.append(
@@ -2752,9 +2760,21 @@ def tools_list(tool_defs, json_, python_tools):
                 }
             )
     if json_:
+        json_output = {"tools": output_tools, "toolboxes": output_toolboxes}
+        if registry and registry.conflicts:
+            json_output["conflicts"] = [
+                {
+                    "name": c.name,
+                    "plugins": c.plugins,
+                    "namespaced": [
+                        "{}:{}".format(derive_namespace(p), c.name) for p in c.plugins
+                    ],
+                }
+                for c in registry.conflicts
+            ]
         click.echo(
             json.dumps(
-                {"tools": output_tools, "toolboxes": output_toolboxes},
+                json_output,
                 indent=2,
             )
         )
@@ -2763,8 +2783,13 @@ def tools_list(tool_defs, json_, python_tools):
             sig = "()"
             if tool.implementation:
                 sig = str(inspect.signature(tool.implementation))
+            ns_prefix = ""
+            if tool.plugin:
+                ns = derive_namespace(tool.plugin)
+                ns_prefix = "[{}] ".format(ns)
             click.echo(
-                "{}{}{}\n".format(
+                "{}{}{}{}\n".format(
+                    ns_prefix,
                     tool.name,
                     sig,
                     " (plugin: {})".format(tool.plugin) if tool.plugin else "",
@@ -2788,6 +2813,14 @@ def tools_list(tool_defs, json_, python_tools):
                 )
                 if tool.description:
                     click.echo(textwrap.indent(tool.description.strip(), "    ") + "\n")
+        # Show conflict summary
+        if registry and registry.conflicts:
+            click.echo("Tool name conflicts:")
+            for c in registry.conflicts:
+                options = ", ".join(
+                    "{}:{}".format(derive_namespace(p), c.name) for p in c.plugins
+                )
+                click.echo("  '{}' -> {}".format(c.name, options))
 
 
 @cli.group(
@@ -4131,28 +4164,63 @@ def _gather_tools(
     if python_tools:
         for code_or_path in python_tools:
             tools.extend(_tools_from_code(code_or_path))
-    registered_tools = get_tools()
-    registered_classes = dict(
-        (key, value)
-        for key, value in registered_tools.items()
-        if inspect.isclass(value)
-    )
-    bad_tools = [
-        tool for tool in tool_specs if tool.split("(")[0] not in registered_tools
-    ]
+    registry = get_tools_with_namespaces()
+    # Build class map from both flat and namespaced dicts for instantiate_from_spec
+    registered_classes: Dict[str, Type] = {}
+    for key, value in registry.tools.items():
+        if inspect.isclass(value):
+            registered_classes[key] = value
+    for key, value in registry.namespaced.items():
+        if inspect.isclass(value):
+            registered_classes[key] = value
+
+    # Validate tool specs
+    bad_tools = []
+    for tool_spec in tool_specs:
+        base = tool_spec.split("(")[0]
+        try:
+            registry.get_tool(base)
+        except (KeyError, AmbiguousToolError):
+            bad_tools.append(tool_spec)
     if bad_tools:
+        available = sorted(
+            list(registry.tools.keys()) + list(registry.namespaced.keys())
+        )
         raise click.ClickException(
             "Tool(s) {} not found. Available tools: {}".format(
-                ", ".join(bad_tools), ", ".join(registered_tools.keys())
+                ", ".join(bad_tools), ", ".join(available)
             )
         )
     for tool_spec in tool_specs:
-        if not tool_spec[0].isupper():
-            # It's a function
-            tools.append(registered_tools[tool_spec])
+        base = tool_spec.split("(")[0]
+        # Check if this is a namespaced reference (e.g., "sqlite:search")
+        ns, _ = split_tool_namespace(base)
+        if "(" in tool_spec:
+            # Toolbox with constructor args
+            cls = registry.get_tool(base)
+            class_map = {base: cls}
+            # Also add the bare class name for instantiate_from_spec regex
+            if ns is not None:
+                _, bare_name = split_tool_namespace(base)
+                class_map[bare_name] = cls
+                # Reconstruct spec with bare name for instantiate_from_spec
+                _, _, args_part = tool_spec.partition("(")
+                tool_spec_for_instantiate = "{}({}".format(bare_name, args_part)
+            else:
+                tool_spec_for_instantiate = tool_spec
+            for ns_key, ns_val in registry.namespaced.items():
+                if ns_val is cls:
+                    # Also add just the class name part
+                    _, cls_bare = split_tool_namespace(ns_key)
+                    class_map[cls_bare] = cls
+            tools.append(instantiate_from_spec(class_map, tool_spec_for_instantiate))
+        elif ns is not None or not base[0].isupper():
+            # Function tool (namespaced or lowercase bare name)
+            tools.append(registry.get_tool(tool_spec))
         else:
-            # It's a class
-            tools.append(instantiate_from_spec(registered_classes, tool_spec))
+            # Toolbox class without args
+            cls = registry.get_tool(base)
+            tools.append(instantiate_from_spec({base: cls}, tool_spec))
     return tools
 
 

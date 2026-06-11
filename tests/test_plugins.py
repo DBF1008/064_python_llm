@@ -281,14 +281,14 @@ def test_register_tools(tmpdir, logs_db):
         result = runner.invoke(cli.cli, ["tools", "list"])
         assert result.exit_code == 0
         assert result.output == (
-            "count_chars(text: str, character: str) -> int (plugin: ToolsPlugin)\n\n"
+            "[ToolsPlugin] count_chars(text: str, character: str) -> int (plugin: ToolsPlugin)\n\n"
             "  Count the number of occurrences of a character in a word.\n\n"
-            "llm_time() -> dict (plugin: llm.default_plugins.default_tools)\n\n"
+            "[default_tools] llm_time() -> dict (plugin: llm.default_plugins.default_tools)\n\n"
             "  Returns the current time, as local time and UTC\n\n"
-            "llm_version() -> str (plugin: llm.default_plugins.default_tools)\n\n"
+            "[default_tools] llm_version() -> str (plugin: llm.default_plugins.default_tools)\n\n"
             "  Return the installed version of llm\n\n"
-            "output_as_json(text: str) (plugin: ToolsPlugin)\n\n"
-            "upper(text: str) -> str (plugin: ToolsPlugin)\n\n"
+            "[ToolsPlugin] output_as_json(text: str) (plugin: ToolsPlugin)\n\n"
+            "[ToolsPlugin] upper(text: str) -> str (plugin: ToolsPlugin)\n\n"
             "  Convert text to uppercase.\n\n"
         )
         # And --json
@@ -308,6 +308,7 @@ def test_register_tools(tmpdir, logs_db):
                         "type": "object",
                     },
                     "plugin": "ToolsPlugin",
+                    "namespace": "ToolsPlugin",
                 },
                 {
                     "arguments": {
@@ -317,12 +318,14 @@ def test_register_tools(tmpdir, logs_db):
                     "description": "Returns the current time, as local time and UTC",
                     "name": "llm_time",
                     "plugin": "llm.default_plugins.default_tools",
+                    "namespace": "default_tools",
                 },
                 {
                     "name": "llm_version",
                     "description": "Return the installed version of llm",
                     "arguments": {"properties": {}, "type": "object"},
                     "plugin": "llm.default_plugins.default_tools",
+                    "namespace": "default_tools",
                 },
                 {
                     "name": "output_as_json",
@@ -333,6 +336,7 @@ def test_register_tools(tmpdir, logs_db):
                         "type": "object",
                     },
                     "plugin": "ToolsPlugin",
+                    "namespace": "ToolsPlugin",
                 },
                 {
                     "name": "upper",
@@ -343,6 +347,7 @@ def test_register_tools(tmpdir, logs_db):
                         "type": "object",
                     },
                     "plugin": "ToolsPlugin",
+                    "namespace": "ToolsPlugin",
                 },
             ],
             "toolboxes": [],
@@ -512,6 +517,198 @@ def test_register_tools(tmpdir, logs_db):
         plugins.pm.unregister(name="ToolsPlugin")
 
 
+def test_derive_namespace():
+    from llm.utils import derive_namespace
+
+    assert derive_namespace("llm.default_plugins.default_tools") == "default_tools"
+    assert derive_namespace("llm_tools_sqlite") == "llm_tools_sqlite"
+    assert derive_namespace("llm-github") == "llm-github"
+    assert derive_namespace("a.b.c") == "c"
+    assert derive_namespace("single") == "single"
+
+
+def test_split_tool_namespace():
+    from llm.utils import split_tool_namespace
+
+    assert split_tool_namespace("sqlite:search") == ("sqlite", "search")
+    assert split_tool_namespace("default_tools:llm_version") == (
+        "default_tools",
+        "llm_version",
+    )
+    assert split_tool_namespace("upper") == (None, "upper")
+    assert split_tool_namespace("my-tool") == (None, "my-tool")
+
+
+def test_get_tools_with_namespaces(tmpdir, logs_db):
+    def upper(text: str) -> str:
+        """Convert text to uppercase."""
+        return text.upper()
+
+    class NSPlugin:
+        __name__ = "NSPlugin"
+
+        @hookimpl
+        def register_tools(self, register):
+            register(llm.Tool.function(upper))
+
+    try:
+        plugins.pm.register(NSPlugin(), name="NSPlugin")
+        registry = llm.get_tools_with_namespaces()
+
+        # Check that namespaced keys exist
+        assert "NSPlugin:upper" in registry.namespaced
+        assert "default_tools:llm_version" in registry.namespaced
+
+        # Check ns_map
+        assert registry._ns_map.get("NSPlugin") == "NSPlugin"
+        assert (
+            registry._ns_map.get("llm.default_plugins.default_tools") == "default_tools"
+        )
+
+        # No conflicts should exist
+        assert len(registry.conflicts) == 0
+
+        # get_tool by bare name should work (no conflict)
+        tool = registry.get_tool("upper")
+        assert tool.name == "upper"
+
+        # get_tool by namespace:name should work
+        tool2 = registry.get_tool("NSPlugin:upper")
+        assert tool2.name == "upper"
+
+        # get_tool with bad name should raise KeyError
+        import pytest
+
+        with pytest.raises(KeyError):
+            registry.get_tool("nonexistent")
+
+        with pytest.raises(KeyError):
+            registry.get_tool("NSPlugin:nonexistent")
+    finally:
+        plugins.pm.unregister(name="NSPlugin")
+
+
+def test_tool_conflict_detection(tmpdir, logs_db, capsys):
+    def upper_a(text: str) -> str:
+        """Uppercase A."""
+        return text.upper()
+
+    def upper_b(text: str) -> str:
+        """Uppercase B."""
+        return text.upper()
+
+    class PluginA:
+        __name__ = "PluginA"
+
+        @hookimpl
+        def register_tools(self, register):
+            register(llm.Tool.function(upper_a, name="upper"))
+
+    class PluginB:
+        __name__ = "PluginB"
+
+        @hookimpl
+        def register_tools(self, register):
+            register(llm.Tool.function(upper_b, name="upper"))
+
+    try:
+        plugins.pm.register(PluginA(), name="PluginA")
+        plugins.pm.register(PluginB(), name="PluginB")
+        registry = llm.get_tools_with_namespaces()
+
+        # Should have detected a conflict
+        assert len(registry.conflicts) == 1
+        conflict = registry.conflicts[0]
+        assert conflict.name == "upper"
+        assert "PluginA" in conflict.plugins
+        assert "PluginB" in conflict.plugins
+
+        # Namespaced access should work for both
+        tool_a = registry.get_tool("PluginA:upper")
+        assert tool_a.description == "Uppercase A."
+        tool_b = registry.get_tool("PluginB:upper")
+        assert tool_b.description == "Uppercase B."
+
+        # Bare name should raise AmbiguousToolError
+        with pytest.raises(llm.AmbiguousToolError) as exc_info:
+            registry.get_tool("upper")
+        assert "ambiguous" in str(exc_info.value).lower()
+        assert "PluginA:upper" in str(exc_info.value)
+        assert "PluginB:upper" in str(exc_info.value)
+
+        # Stderr should contain a warning
+        captured = capsys.readouterr()
+        assert "Warning: tool 'upper' registered by multiple plugins" in captured.err
+    finally:
+        plugins.pm.unregister(name="PluginA")
+        plugins.pm.unregister(name="PluginB")
+
+
+def test_cli_tool_with_namespace(tmpdir, logs_db):
+    def upper(text: str) -> str:
+        """Convert text to uppercase."""
+        return text.upper()
+
+    class NSPlugin2:
+        __name__ = "NSPlugin2"
+
+        @hookimpl
+        def register_tools(self, register):
+            register(llm.Tool.function(upper, name="ns_upper"))
+
+    try:
+        plugins.pm.register(NSPlugin2(), name="NSPlugin2")
+        runner = CliRunner()
+
+        # Using namespace prefix should work
+        result = runner.invoke(
+            cli.cli,
+            [
+                "-m",
+                "echo",
+                "--tool",
+                "NSPlugin2:ns_upper",
+                json.dumps(
+                    {
+                        "tool_calls": [
+                            {"name": "ns_upper", "arguments": {"text": "hello"}}
+                        ]
+                    }
+                ),
+            ],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+        assert '"output": "HELLO"' in result.output
+    finally:
+        plugins.pm.unregister(name="NSPlugin2")
+
+
+def test_backward_compat_get_tools(tmpdir, logs_db):
+    """get_tools() should still return a flat dict unchanged."""
+
+    def my_func(x: int) -> int:
+        """Double it."""
+        return x * 2
+
+    class CompatPlugin:
+        __name__ = "CompatPlugin"
+
+        @hookimpl
+        def register_tools(self, register):
+            register(llm.Tool.function(my_func, name="double_it"))
+
+    try:
+        plugins.pm.register(CompatPlugin(), name="CompatPlugin")
+        tools = llm.get_tools()
+        # Should be a flat dict, same as before
+        assert "double_it" in tools
+        assert isinstance(tools["double_it"], llm.Tool)
+        assert tools["double_it"].plugin == "CompatPlugin"
+    finally:
+        plugins.pm.unregister(name="CompatPlugin")
+
+
 class Memory(llm.Toolbox):
     _memory = None
 
@@ -629,6 +826,7 @@ def test_register_toolbox(tmpdir, logs_db):
                     "description": "Returns the current time, as local time and UTC",
                     "name": "llm_time",
                     "plugin": "llm.default_plugins.default_tools",
+                    "namespace": "default_tools",
                     "arguments": {
                         "properties": {},
                         "type": "object",
@@ -639,6 +837,7 @@ def test_register_toolbox(tmpdir, logs_db):
                     "description": "Return the installed version of llm",
                     "arguments": {"properties": {}, "type": "object"},
                     "plugin": "llm.default_plugins.default_tools",
+                    "namespace": "default_tools",
                 },
             ],
             "toolboxes": [
@@ -702,9 +901,9 @@ def test_register_toolbox(tmpdir, logs_db):
         result = runner.invoke(cli.cli, ["tools"])
         assert result.exit_code == 0
         assert result.output == (
-            "llm_time() -> dict (plugin: llm.default_plugins.default_tools)\n\n"
+            "[default_tools] llm_time() -> dict (plugin: llm.default_plugins.default_tools)\n\n"
             "  Returns the current time, as local time and UTC\n\n"
-            "llm_version() -> str (plugin: llm.default_plugins.default_tools)\n\n"
+            "[default_tools] llm_version() -> str (plugin: llm.default_plugins.default_tools)\n\n"
             "  Return the installed version of llm\n\n"
             "Filesystem:\n\n"
             "  Filesystem_list_files()\n\n"
