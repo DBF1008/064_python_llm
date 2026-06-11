@@ -739,7 +739,7 @@ def prompt(
             fragments = [*template_obj.fragments, *fragments]
         if template_obj.system_fragments:
             system_fragments = [*template_obj.system_fragments, *system_fragments]
-        if template_obj.schema_object:
+        if template_obj.schema_object and not schema:
             schema = template_obj.schema_object
         if template_obj.tools:
             tools = [*template_obj.tools, *tools]
@@ -1130,6 +1130,8 @@ def chat(
         tools = conversation_tools
 
     template_obj = None
+    template_schema = None
+    template_attachments = []
     if template:
         params = dict(param)
         try:
@@ -1142,6 +1144,24 @@ def chat(
             tools = [*template_obj.tools, *tools]
         if template_obj.functions and template_obj._functions_is_trusted:
             python_tools = [template_obj.functions, *python_tools]
+        # Merge template fragments/system_fragments with CLI ones (template first)
+        if template_obj.fragments:
+            fragments = [*template_obj.fragments, *fragments]
+        if template_obj.system_fragments:
+            system_fragments = [*template_obj.system_fragments, *system_fragments]
+        # Template schema used only when no CLI schema (chat has no --schema flag)
+        if template_obj.schema_object:
+            template_schema = template_obj.schema_object
+        # Resolve template attachments
+        if template_obj.attachments:
+            template_attachments = [
+                resolve_attachment(a) for a in template_obj.attachments
+            ]
+        if template_obj.attachment_types:
+            template_attachments.extend(
+                resolve_attachment_with_type(at.value, at.type)
+                for at in template_obj.attachment_types
+            )
 
     # Figure out which model we are using
     if model_id is None:
@@ -1168,8 +1188,8 @@ def chat(
     if tools_approve:
         conversation.before_call = _approve_tool_call
 
-    # Validate options
-    validated_options = get_model_options(model.model_id)
+    # Validate options - CLI options take priority over template, then global defaults
+    validated_options = {}
     if options:
         try:
             validated_options = dict(
@@ -1179,6 +1199,16 @@ def chat(
             )
         except pydantic.ValidationError as ex:
             raise click.ClickException(render_errors(ex.errors()))
+    # Layer in template options where CLI didn't specify
+    if template_obj and template_obj.options:
+        for option_name, option_value in template_obj.options.items():
+            if option_name not in validated_options:
+                validated_options[option_name] = option_value
+    # Layer in global model defaults for any remaining keys
+    default_options = get_model_options(model.model_id)
+    for key_, value in default_options.items():
+        if key_ not in validated_options:
+            validated_options[key_] = value
 
     kwargs = {}
     if validated_options:
@@ -1216,6 +1246,10 @@ def chat(
         argument_system_fragments = resolve_fragments(db, system_fragments)
     except FragmentNotFound as ex:
         raise click.ClickException(str(ex))
+
+    # Include template attachments with CLI attachments for the first message
+    if template_attachments:
+        argument_attachments = [*argument_attachments, *template_attachments]
 
     click.echo("Chatting with {}".format(model.model_id))
     click.echo("Type 'exit' or 'quit' to exit")
@@ -1295,6 +1329,7 @@ def chat(
             system_fragments=argument_system_fragments,
             attachments=attachments,
             system=system,
+            schema=template_schema,
             **kwargs,
         )
 

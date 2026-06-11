@@ -559,3 +559,77 @@ def test_tools_in_templates(
     finally:
         after()
         pm.unregister(name="greetings-plugin")
+
+
+def test_prompt_cli_schema_overrides_template_schema(
+    templates_path, user_path, mock_model
+):
+    """CLI --schema should take priority over template schema_object."""
+    template_schema = json.dumps(
+        {"type": "object", "properties": {"template_field": {"type": "string"}}}
+    )
+    (templates_path / "schema_tmpl.yaml").write_text(
+        f"prompt: $input\nschema_object: {template_schema}\n",
+        "utf-8",
+    )
+
+    cli_schema = json.dumps(
+        {"type": "object", "properties": {"cli_field": {"type": "string"}}}
+    )
+
+    mock_model.enqueue(['{"cli_field": "test"}'])
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "-t",
+            "schema_tmpl",
+            "--schema",
+            cli_schema,
+            "-m",
+            "mock",
+            "hello",
+        ],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+
+    # Check the logged schema matches the CLI schema, not the template schema
+    import sqlite_utils
+
+    db = sqlite_utils.Database(str(user_path / "logs.db"))
+    schemas = list(db["schemas"].rows)
+    assert len(schemas) == 1
+    stored_schema = json.loads(schemas[0]["content"])
+    assert "cli_field" in stored_schema.get("properties", {})
+    assert "template_field" not in stored_schema.get("properties", {})
+
+
+def test_prompt_template_schema_used_when_no_cli_schema(
+    templates_path, user_path, mock_model
+):
+    """When no CLI --schema is provided, template schema_object should be used."""
+    template_schema = json.dumps(
+        {"type": "object", "properties": {"template_field": {"type": "string"}}}
+    )
+    (templates_path / "schema_tmpl2.yaml").write_text(
+        f"prompt: $input\nschema_object: {template_schema}\n",
+        "utf-8",
+    )
+
+    mock_model.enqueue(['{"template_field": "test"}'])
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["-t", "schema_tmpl2", "-m", "mock", "hello"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+
+    import sqlite_utils
+
+    db = sqlite_utils.Database(str(user_path / "logs.db"))
+    schemas = list(db["schemas"].rows)
+    assert len(schemas) == 1
+    stored_schema = json.loads(schemas[0]["content"])
+    assert "template_field" in stored_schema.get("properties", {})
