@@ -372,6 +372,53 @@ You can filter results to only show IDs that begin with a specific prefix using 
 llm similar quotations --prefix 'movies/' -c 'star wars'
 ```
 
+(embeddings-cli-similar-filter)=
+### Filtering by metadata
+
+Use `--filter` to restrict results to items whose stored metadata matches specific criteria. The filter is a JSON object:
+
+```bash
+llm similar quotations -c 'computer science' --filter '{"source": "web"}'
+```
+This returns only items where the `source` metadata field equals `"web"`. Items with no metadata are automatically excluded.
+
+Comparison and set membership operators are supported:
+
+```bash
+# Items from year 2020 or later
+llm similar quotations -c 'computer science' --filter '{"year": {"$gte": 2020}}'
+
+# Items from web or book sources
+llm similar quotations -c 'computer science' --filter '{"source": {"$in": ["web", "book"]}}'
+
+# Multiple fields (implicit AND)
+llm similar quotations -c 'computer science' --filter '{"source": "web", "year": {"$gte": 2020}}'
+```
+Available operators: `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`.
+
+When `--filter` is used, a summary line is appended to the output. In JSON mode (default), this is a final JSON object with a `_summary` key:
+
+```json
+{"id": "philkarlton-1", "score": 0.83, "content": null, "metadata": {"source": "web"}}
+{"_summary": {"count": 1, "total_filtered": 3, "score_stats": {"min": 0.83, "max": 0.83, "avg": 0.83}, "facets": {"source": {"web": 1}}}}
+```
+In plain text mode (`-p`), a human-readable summary section is shown:
+
+```
+philkarlton-1 (0.83)
+
+--- Summary ---
+Results: 1 of 3 filtered matches
+Score: min=0.8300, max=0.8300, avg=0.8300
+Facets:
+  source: web (1)
+```
+The filter works with both content-based search (`-c`) and ID-based search:
+
+```bash
+llm similar quotations philkarlton-1 --filter '{"source": "web"}'
+```
+
 (embeddings-cli-embed-models)=
 ## llm embed-models
 

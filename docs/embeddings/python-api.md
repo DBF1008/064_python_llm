@@ -125,9 +125,9 @@ A collection instance has the following properties and methods:
 - `embed(id: str, text: str, metadata: dict=None, store: bool=False)` - embeds the given string and stores it in the collection under the given ID. Can optionally include metadata (stored as JSON) and store the text content itself in the database table.
 - `embed_multi(entries: Iterable, store: bool=False, batch_size: int=100)` - see above
 - `embed_multi_with_metadata(entries: Iterable, store: bool=False, batch_size: int=100)` - see above
-- `similar(query: str, number: int=10)` - returns a list of entries that are most similar to the embedding of the given query string
-- `similar_by_id(id: str, number: int=10)` - returns a list of entries that are most similar to the embedding of the item with the given ID
-- `similar_by_vector(vector: List[float], number: int=10, skip_id: str=None)` - returns a list of entries that are most similar to the given embedding vector, optionally skipping the entry with the given ID
+- `similar(query: str, number: int=10, filter: dict=None)` - returns a SearchResult of entries most similar to the given query string
+- `similar_by_id(id: str, number: int=10, filter: dict=None)` - returns a SearchResult of entries most similar to the item with the given ID
+- `similar_by_vector(vector: List[float], number: int=10, skip_id: str=None, filter: dict=None)` - returns a SearchResult of entries most similar to the given embedding vector
 - `delete()` - deletes the collection and its embeddings from the database
 
 There is also a `Collection.exists(db, name)` class method which returns a boolean value and can be used to determine if a collection exists or not in a database:
@@ -169,6 +169,66 @@ for entry in collection.similar_by_id("cat"):
     print(entry.id, entry.score)
 ```
 The item itself is excluded from the results.
+
+(embeddings-python-filter)=
+### Filtering by metadata
+
+All three similarity methods (`similar()`, `similar_by_id()`, `similar_by_vector()`) accept an optional `filter` argument to restrict results to items whose stored metadata matches specific criteria. Items with no metadata (`NULL`) are automatically excluded when a filter is active.
+
+```python
+# Shorthand equality
+results = collection.similar("hound", filter={"source": "web"})
+
+# Comparison operators
+results = collection.similar("hound", filter={"year": {"$gte": 2020}})
+
+# Set membership
+results = collection.similar("hound", filter={"source": {"$in": ["web", "book"]}})
+
+# Multiple fields (implicit AND)
+results = collection.similar(
+    "hound", filter={"source": "web", "year": {"$gte": 2020}}
+)
+```
+The same filter can be applied when searching by ID:
+```python
+results = collection.similar_by_id("cat", filter={"source": "web"})
+```
+
+The following operators are supported:
+
+| Operator | Description | Example |
+|----------|-------------|---------|
+| *(shorthand)* | Equality | `{"field": value}` |
+| `$eq` | Equality | `{"field": {"$eq": value}}` |
+| `$ne` | Not equal | `{"field": {"$ne": value}}` |
+| `$gt` | Greater than | `{"field": {"$gt": value}}` |
+| `$gte` | Greater than or equal | `{"field": {"$gte": value}}` |
+| `$lt` | Less than | `{"field": {"$lt": value}}` |
+| `$lte` | Less than or equal | `{"field": {"$lte": value}}` |
+| `$in` | Value in list | `{"field": {"$in": [v1, v2]}}` |
+
+Dot-separated paths can be used to filter on nested metadata fields:
+```python
+results = collection.similar("hound", filter={"author.name": "Alice"})
+```
+
+When a filter is applied, the return value is a `SearchResult` object (a `list` subclass) with additional `summary` and `filter` attributes:
+
+```python
+results = collection.similar("hound", filter={"source": "web"})
+print(len(results))          # number of entries returned
+print(results.summary)       # aggregate statistics
+# {"count": 3, "total_filtered": 3, "score_stats": {"min": 0.7, "max": 0.95, "avg": 0.82}, "facets": {"source": {"web": 3}, ...}}
+print(results.filter)        # the filter dict that was applied
+```
+The `summary` dict contains:
+- `count` - number of entries in the result set (up to `number`)
+- `total_filtered` - total number of items matching the filter (may exceed `count` if `LIMIT` was reached)
+- `score_stats` - `min`, `max`, and `avg` similarity scores
+- `facets` - unique value distributions for each metadata field across the result set
+
+When no filter is applied, `summary` and `filter` are both `None` and the return value behaves exactly like a plain `list` of `Entry` objects.
 
 (embeddings-sql-schema)=
 ## SQL schema

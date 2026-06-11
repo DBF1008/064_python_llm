@@ -3502,7 +3502,13 @@ def embed_multi(
     envvar="LLM_EMBEDDINGS_DB",
 )
 @click.option("--prefix", help="Just IDs with this prefix", default="")
-def similar(collection, id, input, content, binary, number, plain, database, prefix):
+@click.option(
+    "--filter",
+    "filter_json",
+    default=None,
+    help='Filter by metadata JSON, e.g. \'{"source": "web"}\'',
+)
+def similar(collection, id, input, content, binary, number, plain, database, prefix, filter_json):
     """
     Return top N similar IDs from a collection using cosine similarity.
 
@@ -3519,6 +3525,16 @@ def similar(collection, id, input, content, binary, number, plain, database, pre
     if not id and not content and not input:
         raise click.ClickException("Must provide content or an ID for the comparison")
 
+    # Parse filter JSON if provided
+    filter_dict = None
+    if filter_json:
+        try:
+            filter_dict = json.loads(filter_json)
+        except json.JSONDecodeError as e:
+            raise click.ClickException(f"Invalid filter JSON: {e}")
+        if not isinstance(filter_dict, dict):
+            raise click.ClickException("Filter must be a JSON object")
+
     if database:
         db = sqlite_utils.Database(database)
     else:
@@ -3534,7 +3550,9 @@ def similar(collection, id, input, content, binary, number, plain, database, pre
 
     if id:
         try:
-            results = collection_obj.similar_by_id(id, number, prefix=prefix)
+            results = collection_obj.similar_by_id(
+                id, number, prefix=prefix, filter=filter_dict
+            )
         except Collection.DoesNotExist:
             raise click.ClickException("ID not found in collection")
     else:
@@ -3550,7 +3568,9 @@ def similar(collection, id, input, content, binary, number, plain, database, pre
                     content = f.read()
         if not content:
             raise click.ClickException("No content provided")
-        results = collection_obj.similar(content, number, prefix=prefix)
+        results = collection_obj.similar(
+            content, number, prefix=prefix, filter=filter_dict
+        )
 
     for result in results:
         if plain:
@@ -3562,6 +3582,28 @@ def similar(collection, id, input, content, binary, number, plain, database, pre
             click.echo("")
         else:
             click.echo(json.dumps(asdict(result)))
+
+    # Output summary if a filter was applied
+    summary = getattr(results, "summary", None)
+    if summary:
+        if plain:
+            click.echo("--- Summary ---")
+            click.echo(
+                f"Results: {summary['count']} of {summary['total_filtered']} filtered matches"
+            )
+            stats = summary["score_stats"]
+            if stats["min"] is not None:
+                click.echo(
+                    f"Score: min={stats['min']:.4f}, max={stats['max']:.4f}, avg={stats['avg']:.4f}"
+                )
+            facets = summary.get("facets", {})
+            if facets:
+                click.echo("Facets:")
+                for field, values in facets.items():
+                    parts = ", ".join(f"{v} ({c})" for v, c in values.items())
+                    click.echo(f"  {field}: {parts}")
+        else:
+            click.echo(json.dumps({"_summary": summary}))
 
 
 @cli.group(

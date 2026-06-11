@@ -1,9 +1,11 @@
+import collections
 from .models import EmbeddingModel
 from .embeddings_migrations import embeddings_migrations
 from dataclasses import dataclass
 import hashlib
 from itertools import islice
 import json
+import re
 from sqlite_utils import Database
 from sqlite_utils.db import Table
 import time
@@ -16,6 +18,110 @@ class Entry:
     score: Optional[float]
     content: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
+
+
+class SearchResult(list):
+    """List subclass that carries result summary metadata alongside entries.
+
+    Behaves exactly like a regular list of Entry objects. When a metadata
+    filter was applied during the search, the ``summary`` and ``filter``
+    attributes provide aggregate statistics about the filtered result set.
+    """
+
+    @property
+    def summary(self) -> Optional[Dict[str, Any]]:
+        return getattr(self, "_summary", None)
+
+    @summary.setter
+    def summary(self, value: Optional[Dict[str, Any]]):
+        self._summary = value
+
+    @property
+    def filter(self) -> Optional[Dict[str, Any]]:
+        return getattr(self, "_filter", None)
+
+    @filter.setter
+    def filter(self, value: Optional[Dict[str, Any]]):
+        self._filter = value
+
+
+# ---------------------------------------------------------------------------
+# Metadata filter -> SQL translation
+# ---------------------------------------------------------------------------
+
+_VALID_FIELD = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$"
+)
+_OPERATORS = {"$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in"}
+_OP_MAP = {
+    "$eq": "=",
+    "$ne": "!=",
+    "$gt": ">",
+    "$gte": ">=",
+    "$lt": "<",
+    "$lte": "<=",
+}
+
+
+def _filter_to_sql(filter_dict: Dict[str, Any]) -> Tuple[List[str], List[Any]]:
+    """Translate a metadata filter dict into SQLite WHERE clause fragments.
+
+    Returns (sql_bits, args) where sql_bits is a list of SQL expressions
+    to be joined with AND, and args is the corresponding list of bind
+    parameters.
+
+    Supported forms:
+        {"field": value}                          -> equality
+        {"field": {"$eq": value}}                 -> equality
+        {"field": {"$ne": value}}                 -> inequality
+        {"field": {"$gt/$gte/$lt/$lte": value}}   -> comparison
+        {"field": {"$in": [v1, v2, ...]}}         -> set membership
+        {"f1": v1, "f2": v2}                      -> implicit AND
+    """
+    if not isinstance(filter_dict, dict):
+        raise ValueError("Filter must be a dict")
+    if not filter_dict:
+        return [], []
+
+    sql_bits: List[str] = []
+    args: List[Any] = []
+
+    for field, condition in filter_dict.items():
+        if not _VALID_FIELD.match(field):
+            raise ValueError(
+                f"Invalid field name: {field!r}. "
+                "Field names must match [A-Za-z_][A-Za-z0-9_]* "
+                "(dot-separated paths allowed)."
+            )
+
+        json_path = "$." + field
+        extract = f"json_extract(metadata, '{json_path}')"
+
+        if isinstance(condition, dict):
+            for op, value in condition.items():
+                if op not in _OPERATORS:
+                    raise ValueError(
+                        f"Unsupported operator: {op!r}. "
+                        f"Supported: {', '.join(sorted(_OPERATORS))}"
+                    )
+                if op == "$in":
+                    if not isinstance(value, (list, tuple)):
+                        raise ValueError("$in requires a list value")
+                    if len(value) == 0:
+                        raise ValueError("$in requires a non-empty list")
+                    placeholders = ", ".join("?" for _ in value)
+                    sql_bits.append(f"{extract} IN ({placeholders})")
+                    args.extend(value)
+                else:
+                    sql_op = _OP_MAP[op]
+                    sql_bits.append(f"{extract} {sql_op} ?")
+                    args.append(value)
+        else:
+            # Shorthand equality
+            sql_bits.append(f"{extract} = ?")
+            args.append(condition)
+
+    return sql_bits, args
 
 
 class Collection:
@@ -241,7 +347,8 @@ class Collection:
         number: int = 10,
         skip_id: Optional[str] = None,
         prefix: Optional[str] = None,
-    ) -> List[Entry]:
+        filter: Optional[Dict[str, Any]] = None,
+    ) -> SearchResult:
         """
         Find similar items in the collection by a given vector.
 
@@ -249,10 +356,13 @@ class Collection:
             vector (list): Vector to search by
             number (int, optional): Number of similar items to return
             skip_id (str, optional): An ID to exclude from the results
-            prefix: (str, optional): Filter results to IDs witih this prefix
+            prefix: (str, optional): Filter results to IDs with this prefix
+            filter (dict, optional): Metadata filter dict, e.g.
+                ``{"source": "web"}`` or ``{"year": {"$gte": 2020}}``.
+                Supports operators: $eq, $ne, $gt, $gte, $lt, $lte, $in.
 
         Returns:
-            list: List of Entry objects
+            SearchResult: List of Entry objects with optional summary metadata
         """
         import llm
 
@@ -263,7 +373,7 @@ class Collection:
         self.db.register_function(distance_score, replace=True)
 
         where_bits = ["collection_id = ?"]
-        where_args = [str(self.id)]
+        where_args: List[Any] = [str(self.id)]
 
         if prefix:
             where_bits.append("id LIKE ? || '%'")
@@ -273,7 +383,13 @@ class Collection:
             where_bits.append("id != ?")
             where_args.append(skip_id)
 
-        return [
+        if filter:
+            filter_bits, filter_args = _filter_to_sql(filter)
+            where_bits.append("metadata IS NOT NULL")
+            where_bits.extend(filter_bits)
+            where_args.extend(filter_args)
+
+        entries = [
             Entry(
                 id=row["id"],
                 score=row["score"],
@@ -294,9 +410,49 @@ class Collection:
             )
         ]
 
+        result = SearchResult(entries)
+
+        if filter:
+            result.filter = filter
+            # Total count matching the filter (may exceed LIMIT)
+            total_filtered = next(
+                self.db.query(
+                    "select count(*) as c from embeddings where {where}".format(
+                        where=" and ".join(where_bits),
+                    ),
+                    where_args,
+                )
+            )["c"]
+            # Facets: unique metadata value distributions in the result set
+            facets: Dict[str, collections.Counter] = {}
+            for entry in entries:
+                if entry.metadata:
+                    for key, val in entry.metadata.items():
+                        facets.setdefault(key, collections.Counter())
+                        facets[key][val] += 1
+            scores = [e.score for e in entries if e.score is not None]
+            result.summary = {
+                "count": len(entries),
+                "total_filtered": total_filtered,
+                "score_stats": {
+                    "min": min(scores) if scores else None,
+                    "max": max(scores) if scores else None,
+                    "avg": (sum(scores) / len(scores)) if scores else None,
+                },
+                "facets": {
+                    k: dict(v.most_common()) for k, v in facets.items()
+                },
+            }
+
+        return result
+
     def similar_by_id(
-        self, id: str, number: int = 10, prefix: Optional[str] = None
-    ) -> List[Entry]:
+        self,
+        id: str,
+        number: int = 10,
+        prefix: Optional[str] = None,
+        filter: Optional[Dict[str, Any]] = None,
+    ) -> SearchResult:
         """
         Find similar items in the collection by a given ID.
 
@@ -304,9 +460,10 @@ class Collection:
             id (str): ID to search by
             number (int, optional): Number of similar items to return
             prefix: (str, optional): Filter results to IDs with this prefix
+            filter (dict, optional): Metadata filter dict
 
         Returns:
-            list: List of Entry objects
+            SearchResult: List of Entry objects with optional summary metadata
         """
         import llm
 
@@ -320,12 +477,16 @@ class Collection:
         embedding = matches[0]["embedding"]
         comparison_vector = llm.decode(embedding)
         return self.similar_by_vector(
-            comparison_vector, number, skip_id=id, prefix=prefix
+            comparison_vector, number, skip_id=id, prefix=prefix, filter=filter
         )
 
     def similar(
-        self, value: Union[str, bytes], number: int = 10, prefix: Optional[str] = None
-    ) -> List[Entry]:
+        self,
+        value: Union[str, bytes],
+        number: int = 10,
+        prefix: Optional[str] = None,
+        filter: Optional[Dict[str, Any]] = None,
+    ) -> SearchResult:
         """
         Find similar items in the collection by a given value.
 
@@ -333,12 +494,15 @@ class Collection:
             value (str or bytes): value to search by
             number (int, optional): Number of similar items to return
             prefix: (str, optional): Filter results to IDs with this prefix
+            filter (dict, optional): Metadata filter dict
 
         Returns:
-            list: List of Entry objects
+            SearchResult: List of Entry objects with optional summary metadata
         """
         comparison_vector = self.model().embed(value)
-        return self.similar_by_vector(comparison_vector, number, prefix=prefix)
+        return self.similar_by_vector(
+            comparison_vector, number, prefix=prefix, filter=filter
+        )
 
     @classmethod
     def exists(cls, db: Database, name: str) -> bool:

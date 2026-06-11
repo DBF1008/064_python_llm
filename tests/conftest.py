@@ -37,6 +37,33 @@ def user_path_with_embeddings(user_path):
 
 
 @pytest.fixture
+def user_path_with_embeddings_and_metadata(user_path):
+    path = str(user_path / "embeddings.db")
+    db = sqlite_utils.Database(path)
+    collection = llm.Collection("demo", db, model_id="embed-demo")
+    collection.embed("1", "hello world", store=True)
+    collection.embed("2", "goodbye world", store=True)
+    collection.embed(
+        "3",
+        "hello cats",
+        metadata={"source": "web", "year": 2023, "category": "animals"},
+        store=True,
+    )
+    collection.embed(
+        "4",
+        "goodbye dogs",
+        metadata={"source": "book", "year": 2021, "category": "animals"},
+        store=True,
+    )
+    collection.embed(
+        "5",
+        "hello universe",
+        metadata={"source": "web", "year": 2020, "category": "space"},
+        store=True,
+    )
+
+
+@pytest.fixture
 def templates_path(user_path):
     dir = user_path / "templates"
     dir.mkdir()

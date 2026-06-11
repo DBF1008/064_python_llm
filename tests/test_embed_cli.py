@@ -296,6 +296,121 @@ def test_similar_by_content_prefixed(
     assert json.loads(result.output) == expected_result
 
 
+# ---------------------------------------------------------------------------
+# Metadata filter CLI tests
+# ---------------------------------------------------------------------------
+
+
+def test_similar_filter_json_output(user_path_with_embeddings_and_metadata):
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "similar",
+            "demo",
+            "-c",
+            "hello",
+            "--filter",
+            '{"source": "web"}',
+        ],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    lines = [line for line in result.output.splitlines() if line.strip()]
+    # Should have result lines plus a summary line
+    assert len(lines) >= 1
+    # Last line should be the summary
+    summary_line = json.loads(lines[-1])
+    assert "_summary" in summary_line
+    summary = summary_line["_summary"]
+    assert "count" in summary
+    assert "total_filtered" in summary
+    assert "score_stats" in summary
+    assert "facets" in summary
+    # Result entries should only have source=web items
+    for line in lines[:-1]:
+        entry = json.loads(line)
+        assert entry["metadata"]["source"] == "web"
+
+
+def test_similar_filter_plain_output(user_path_with_embeddings_and_metadata):
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "similar",
+            "demo",
+            "-c",
+            "hello",
+            "--filter",
+            '{"source": "web"}',
+            "-p",
+        ],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    assert "--- Summary ---" in result.output
+    assert "filtered matches" in result.output
+
+
+def test_similar_filter_invalid_json(user_path_with_embeddings_and_metadata):
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["similar", "demo", "-c", "hello", "--filter", "not json"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code != 0
+    assert "Invalid filter JSON" in result.output
+
+
+def test_similar_filter_not_object(user_path_with_embeddings_and_metadata):
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["similar", "demo", "-c", "hello", "--filter", '"a string"'],
+        catch_exceptions=False,
+    )
+    assert result.exit_code != 0
+    assert "JSON object" in result.output
+
+
+def test_similar_no_filter_no_summary(user_path_with_embeddings):
+    """Without --filter, output should not contain summary."""
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["similar", "demo", "-c", "hello world"],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    assert "_summary" not in result.output
+
+
+def test_similar_filter_by_id(user_path_with_embeddings_and_metadata):
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "similar",
+            "demo",
+            "3",
+            "--filter",
+            '{"source": "web"}',
+        ],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+    lines = [line for line in result.output.splitlines() if line.strip()]
+    summary_line = json.loads(lines[-1])
+    assert "_summary" in summary_line
+    # Result entries should not include id 3 (skip_id) or non-web items
+    for line in lines[:-1]:
+        entry = json.loads(line)
+        assert entry["id"] != "3"
+        assert entry["metadata"]["source"] == "web"
+
+
 @pytest.mark.parametrize("use_stdin", (False, True))
 @pytest.mark.parametrize("prefix", (None, "prefix"))
 @pytest.mark.parametrize("prepend", (None, "search_document: "))

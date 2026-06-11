@@ -35,7 +35,7 @@ from .parts import (
     user,
 )
 from .utils import schema_dsl, Fragment
-from .embeddings import Collection
+from .embeddings import Collection, SearchResult
 from .templates import Template
 from .plugins import pm, load_plugins
 import click
@@ -70,6 +70,7 @@ __all__ = [
     "PauseChain",
     "Prompt",
     "Response",
+    "SearchResult",
     "schema_dsl",
     "system",
     "Template",
