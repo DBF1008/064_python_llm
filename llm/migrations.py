@@ -426,3 +426,13 @@ def m022_response_reasoning(db):
     # NULL/empty when no reasoning was emitted or when the provider
     # only reported an opaque token count (the redacted-marker case).
     db["responses"].add_column("reasoning", str)
+
+
+@migration
+def m023_messages_json(db):
+    # Structured output messages for full-fidelity restoration.
+    # Stores [Message.to_dict() ...] JSON preserving reasoning parts,
+    # provider_metadata (encrypted_content, signatures), tool call ids,
+    # and multi-message structure.  NULL for pre-existing rows;
+    # from_row() falls back to the legacy _build_parts() path.
+    db["responses"].add_column("messages_json", str)

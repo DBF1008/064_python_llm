@@ -62,6 +62,7 @@ def test_chat_basic(mock_model, logs_db):
             "token_details": None,
             "schema_id": None,
             "reasoning": None,
+            "messages_json": ANY,
         },
         {
             "id": ANY,
@@ -81,6 +82,7 @@ def test_chat_basic(mock_model, logs_db):
             "token_details": None,
             "schema_id": None,
             "reasoning": None,
+            "messages_json": ANY,
         },
     ]
     # Now continue that conversation

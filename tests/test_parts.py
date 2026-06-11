@@ -1224,6 +1224,247 @@ class TestSqliteRehydrateMessages:
         assert isinstance(r3.prompt.messages[2].parts[0], llm.parts.ToolResultPart)
         assert r3.prompt.messages[2].parts[0].tool_call_id == "c1"
 
+    def test_from_row_preserves_reasoning_with_provider_metadata(
+        self, mock_model, tmp_path
+    ):
+        """ReasoningPart with provider_metadata (encrypted_content, id)
+        must survive a DB round-trip so Responses-API reasoning models
+        can resume their chain of thought."""
+        import sqlite_utils
+        from llm.migrations import migrate
+
+        mock_model.enqueue(
+            [
+                llm.parts.StreamEvent(
+                    type="reasoning",
+                    chunk="thinking...",
+                    part_index=0,
+                    provider_metadata={
+                        "openai": {
+                            "encrypted_content": "enc-abc-123",
+                            "id": "rs_001",
+                            "summary": [
+                                {"type": "summary_text", "text": "I thought"}
+                            ],
+                        }
+                    },
+                ),
+                llm.parts.StreamEvent(type="text", chunk="answer", part_index=1),
+            ]
+        )
+        r1 = mock_model.prompt("q1")
+        r1.text()
+
+        db = sqlite_utils.Database(str(tmp_path / "logs.db"))
+        migrate(db)
+        r1.log_to_db(db)
+
+        row = next(db["responses"].rows)
+        rehydrated = llm.Response.from_row(db, row)
+
+        msgs = rehydrated.messages()
+        assert len(msgs) == 1
+        assert msgs[0].role == "assistant"
+        assert isinstance(msgs[0].parts[0], llm.parts.ReasoningPart)
+        assert msgs[0].parts[0].text == "thinking..."
+        assert msgs[0].parts[0].provider_metadata == {
+            "openai": {
+                "encrypted_content": "enc-abc-123",
+                "id": "rs_001",
+                "summary": [{"type": "summary_text", "text": "I thought"}],
+            }
+        }
+        assert isinstance(msgs[0].parts[1], llm.parts.TextPart)
+        assert msgs[0].parts[1].text == "answer"
+
+    def test_from_row_preserves_tool_call_provider_metadata(
+        self, mock_model, tmp_path
+    ):
+        """ToolCallPart provider_metadata must survive a DB round-trip."""
+        import sqlite_utils
+        from llm.migrations import migrate
+
+        mock_model.enqueue(
+            [
+                llm.parts.StreamEvent(
+                    type="tool_call_name",
+                    chunk="search",
+                    tool_call_id="call_abc",
+                ),
+                llm.parts.StreamEvent(
+                    type="tool_call_args",
+                    chunk='{"q": "weather"}',
+                    tool_call_id="call_abc",
+                    provider_metadata={"openai": {"index": 0}},
+                ),
+            ]
+        )
+        r1 = mock_model.prompt("q1")
+        r1.text()
+
+        db = sqlite_utils.Database(str(tmp_path / "logs.db"))
+        migrate(db)
+        r1.log_to_db(db)
+
+        row = next(db["responses"].rows)
+        rehydrated = llm.Response.from_row(db, row)
+
+        msgs = rehydrated.messages()
+        tool_part = msgs[0].parts[0]
+        assert isinstance(tool_part, llm.parts.ToolCallPart)
+        assert tool_part.name == "search"
+        assert tool_part.arguments == {"q": "weather"}
+        assert tool_part.tool_call_id == "call_abc"
+        assert tool_part.provider_metadata == {"openai": {"index": 0}}
+
+    def test_llm_dash_c_preserves_reasoning_for_continuation(
+        self, mock_model, tmp_path
+    ):
+        """End-to-end: reasoning provider_metadata must appear in
+        the continued conversation chain so _build_responses_input
+        can emit the reasoning item for the Responses API."""
+        import sqlite_utils
+        from llm.cli import load_conversation
+        from llm.migrations import migrate
+
+        mock_model.enqueue(
+            [
+                llm.parts.StreamEvent(
+                    type="reasoning",
+                    chunk="thinking",
+                    part_index=0,
+                    provider_metadata={
+                        "openai": {
+                            "encrypted_content": "enc-xyz",
+                            "id": "rs_002",
+                        }
+                    },
+                ),
+                llm.parts.StreamEvent(type="text", chunk="result", part_index=1),
+            ]
+        )
+        mock_model.enqueue(["follow-up answer"])
+        r1 = mock_model.prompt("q1")
+        r1.text()
+
+        db_path = tmp_path / "logs.db"
+        db = sqlite_utils.Database(str(db_path))
+        migrate(db)
+        r1.log_to_db(db)
+
+        conv = load_conversation(None, database=str(db_path))
+        r2 = conv.prompt("q2")
+        r2.text()
+
+        reasoning_parts = [
+            p
+            for m in r2.prompt.messages
+            for p in m.parts
+            if isinstance(p, llm.parts.ReasoningPart)
+        ]
+        assert len(reasoning_parts) == 1
+        assert reasoning_parts[0].provider_metadata == {
+            "openai": {"encrypted_content": "enc-xyz", "id": "rs_002"}
+        }
+
+    def test_from_row_attachments_in_prompt_messages(self, mock_model, tmp_path):
+        """Attachments logged with a response must appear in
+        Prompt.messages after from_row, not vanish."""
+        import sqlite_utils
+        from llm.migrations import migrate
+
+        att = llm.Attachment(url="https://example.com/img.jpg", type="image/png")
+        mock_model.enqueue(["description of image"])
+        r1 = mock_model.prompt("describe this", attachments=[att])
+        r1.text()
+
+        db = sqlite_utils.Database(str(tmp_path / "logs.db"))
+        migrate(db)
+        r1.log_to_db(db)
+
+        row = next(db["responses"].rows)
+        rehydrated = llm.Response.from_row(db, row)
+
+        user_msgs = [m for m in rehydrated.prompt.messages if m.role == "user"]
+        assert len(user_msgs) == 1
+        attachment_parts = [
+            p
+            for p in user_msgs[0].parts
+            if isinstance(p, llm.parts.AttachmentPart)
+        ]
+        assert len(attachment_parts) == 1
+        assert attachment_parts[0].attachment.url == "https://example.com/img.jpg"
+
+    def test_from_row_without_messages_json_uses_fallback(
+        self, mock_model, tmp_path
+    ):
+        """Pre-m023 rows (messages_json=NULL) must still work via
+        the legacy _build_parts fallback — no regression."""
+        import sqlite_utils
+        from llm.migrations import migrate
+
+        mock_model.enqueue(["answer text"])
+        r1 = mock_model.prompt("q1")
+        r1.text()
+
+        db = sqlite_utils.Database(str(tmp_path / "logs.db"))
+        migrate(db)
+        r1.log_to_db(db)
+
+        db.execute("UPDATE responses SET messages_json = NULL")
+
+        row = next(db["responses"].rows)
+        rehydrated = llm.Response.from_row(db, row)
+
+        assert rehydrated.messages() == [
+            llm.Message(
+                role="assistant", parts=[llm.parts.TextPart(text="answer text")]
+            )
+        ]
+
+    def test_from_row_tool_results_include_exception(self, mock_model, tmp_path):
+        """ToolResult.exception must be restored from DB."""
+        import sqlite_utils
+        from llm.migrations import migrate
+
+        class ToolChainMock(type(mock_model)):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            def execute(self, prompt, stream, response, conversation):
+                self.calls += 1
+                if self.calls == 1:
+                    response.add_tool_call(
+                        llm.ToolCall(
+                            name="fail_tool",
+                            arguments={},
+                            tool_call_id="c1",
+                        )
+                    )
+                    if False:
+                        yield ""
+                else:
+                    yield "handled error"
+
+        def fail_tool() -> str:
+            "A tool that fails"
+            raise ValueError("intentional failure")
+
+        m = ToolChainMock()
+        chain_response = m.chain("test", tools=[fail_tool])
+        chain_response.text()
+
+        db_path = tmp_path / "logs.db"
+        db = sqlite_utils.Database(str(db_path))
+        migrate(db)
+        chain_response.log_to_db(db)
+
+        tool_result_rows = list(db["tool_results"].rows)
+        exception_rows = [r for r in tool_result_rows if r.get("exception")]
+        assert len(exception_rows) >= 1
+        assert "ValueError" in exception_rows[0]["exception"]
+
 
 class TestAddToolCallWithStreamEvents:
     """A plugin may yield StreamEvents *and* call response.add_tool_call().

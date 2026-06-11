@@ -1336,6 +1336,7 @@ class _BaseResponse:
                 name=tool_results_row["name"],
                 output=tool_results_row["output"],
                 tool_call_id=tool_results_row["tool_call_id"],
+                exception=tool_results_row.get("exception"),
             )
             for tool_results_row in db.query(
                 """
@@ -1353,13 +1354,27 @@ class _BaseResponse:
         system_fragments = [
             row["content"] for row in all_fragments if row["fragment_type"] == "system"
         ]
+        # Load attachments before Prompt construction so
+        # Prompt.messages includes them in the synthesized user turn.
+        loaded_attachments = [
+            Attachment.from_row(attachment_row)
+            for attachment_row in db.query(
+                """
+                select attachments.* from attachments
+                join prompt_attachments on attachments.id = prompt_attachments.attachment_id
+                where prompt_attachments.response_id = ?
+                order by prompt_attachments."order"
+            """,
+                [row["id"]],
+            )
+        ]
         response = cls(
             model=model,
             prompt=Prompt(
                 prompt=row["prompt"],
                 model=model,
                 fragments=fragments,
-                attachments=[],
+                attachments=loaded_attachments,
                 system=row["system"],
                 schema=schema,
                 tools=tools,
@@ -1375,19 +1390,7 @@ class _BaseResponse:
         response.response_json = json.loads(row["response_json"] or "null")
         response._done = True
         response._chunks = [row["response"]]
-        # Attachments
-        response.attachments = [
-            Attachment.from_row(attachment_row)
-            for attachment_row in db.query(
-                """
-                select attachments.* from attachments
-                join prompt_attachments on attachments.id = prompt_attachments.attachment_id
-                where prompt_attachments.response_id = ?
-                order by prompt_attachments."order"
-            """,
-                [row["id"]],
-            )
-        ]
+        response.attachments = loaded_attachments
         # Tool calls
         response._tool_calls = [
             ToolCall(
@@ -1404,6 +1407,22 @@ class _BaseResponse:
                 [row["id"]],
             )
         ]
+
+        # Restore structured output messages if available (m023+).
+        # When set, _messages_now() returns these directly, bypassing
+        # the lossy _build_parts() fallback that only synthesizes
+        # TextPart + ToolCallPart and drops reasoning/provider_metadata.
+        from .parts import Message as _Message
+
+        messages_json_raw = row.get("messages_json")
+        if messages_json_raw:
+            try:
+                response._loaded_messages = [
+                    _Message.from_dict(d)
+                    for d in json.loads(messages_json_raw)
+                ]
+            except (json.JSONDecodeError, KeyError, ValueError):
+                pass
 
         return response
 
@@ -1471,12 +1490,18 @@ class _BaseResponse:
         # ReasoningPart entries; redacted markers contribute nothing.
         from .parts import ReasoningPart
 
+        output_messages = self._messages_now()
         reasoning_text = "".join(
             p.text
-            for m in self._messages_now()
+            for m in output_messages
             for p in m.parts
             if isinstance(p, ReasoningPart) and p.text
         )
+        # Structured output for full-fidelity restoration (m023+).
+        # Deliberately not passed through condense_json — opaque
+        # provider data (encrypted_content, signatures) must survive
+        # verbatim.
+        messages_json_str = json.dumps([m.to_dict() for m in output_messages])
         json_data = self.json()
 
         response = {
@@ -1503,6 +1528,7 @@ class _BaseResponse:
             ),
             "schema_id": schema_id,
             "resolved_model": self.resolved_model,
+            "messages_json": messages_json_str,
         }
         db["responses"].insert(response)
 
